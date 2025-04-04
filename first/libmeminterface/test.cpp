@@ -1,7 +1,11 @@
-#include "include/libmem/libmem.h"
+#ifdef _WIN32
+#include "LIBMEMWIN/includeWIN/libmem/libmem.h"
+#else
+#include "LIBMEMLIN/includeLIN/libmem/libmem.h"
+#endif
+
 #include <iostream>
 #include <string>
-#include <cstdint>
 #include <map>
 
 // Callback function to list processes and store them in a map
@@ -79,7 +83,9 @@ int main(int argc, char* argv[]) {
     std::string signature = "90"; //for testing purposes
     if (module_name == "all") {
         // Scan all modules
-        for (const auto& [name, module] : module_map) {
+        for (const auto& pair : module_map) {
+            const std::string& name = pair.first;
+            const lm_module_t& module = pair.second;
             PerformSignatureScan(&process, const_cast<lm_module_t*>(&module), signature);
         }
     } else {
