@@ -1,5 +1,5 @@
-export LD_LIBRARY_PATH=$PWD/lib
-g++ -std=c++20 -I include/libmem/ -L lib/ -llibmem -o test test.cpp
+export LD_LIBRARY_PATH=$PWD/libLIN
+g++ -std=c++20 -I includeLIN/libmem/ -L libLIN/ -llibmem -o test test.cpp
 if [ $? -ne 0 ]; then
     echo "Build failed."
     exit 1

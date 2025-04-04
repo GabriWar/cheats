@@ -1,8 +1,21 @@
-:: filepath: /home/gabriwar/Desktop/gitthings/cheats/first/libmeminterface/build.bat
 @echo off
-set "LD_LIBRARY_PATH=%cd%\lib"
-g++ -std=c++20 -I include\libmem\ -L lib\ -llibmem -o test.exe test.cpp
-if errorlevel 1 exit /b %errorlevel%
-:: Make the output executable (not needed on Windows, but kept for parity)
-:: Invoke passing arguments passed to the script
-test.exe %*
+setlocal
+
+:: Set paths
+set INCLUDE_PATH=%~dp0includeWIN\libmem
+set LIB_PATH=%~dp0libWIN\release
+
+:: Get MSVC and SDK versions
+set /p MSVC_VERSION=<%~dp0MSVC_VERSION.txt
+set /p WINSDK_VERSION=<%~dp0WINSDK_VERSION.txt
+
+:: Compile
+cl.exe /std:c++20 /I"%INCLUDE_PATH%" /link /LIBPATH:"%LIB_PATH%" libmem.lib /out:test.exe test.cpp
+
+if errorlevel 1 (
+    echo Build failed.
+    exit /b 1
+)
+
+:: Run the program with any passed arguments
+test.exe %* 
