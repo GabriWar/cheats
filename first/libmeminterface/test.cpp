@@ -5,9 +5,63 @@
 #ifdef _WIN32
     // Windows-specific includes
     #include <windows.h>
+    #include <conio.h> // For _kbhit() and _getch()
 #else
     // Linux-specific includes
     #include <unistd.h>
+    #include <termios.h> // For terminal settings
+    #include <fcntl.h>   // For non-blocking I/O
+    #include <sys/select.h> // For select() functionality
+    #include <cstring> // For srtcmp()
+    
+
+    // Non-blocking keyboard input functions for Linux
+    bool kbhit() {
+        struct timeval tv = { 0L, 0L };
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(STDIN_FILENO, &fds);
+        return select(1, &fds, NULL, NULL, &tv) > 0;
+    }
+
+    int getch() {
+        int r;
+        unsigned char c;
+        if ((r = read(STDIN_FILENO, &c, sizeof(c))) < 0) {
+            return r;
+        } else {
+            return c;
+        }
+    }
+
+    // Set terminal to raw mode for direct character input
+    void set_raw_mode(bool enable) {
+        static struct termios old_tio;
+        static bool is_raw = false;
+        
+        if (enable && !is_raw) {
+            struct termios new_tio;
+            tcgetattr(STDIN_FILENO, &old_tio);
+            new_tio = old_tio;
+            new_tio.c_lflag &= ~(ICANON | ECHO);
+            tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+            
+            // Set stdin to non-blocking
+            int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+            fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+            
+            is_raw = true;
+        } else if (!enable && is_raw) {
+            // Restore the old terminal settings
+            tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+            
+            // Reset stdin to blocking
+            int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+            fcntl(STDIN_FILENO, F_SETFL, flags & ~O_NONBLOCK);
+            
+            is_raw = false;
+        }
+    }
 #endif
 #include "LIBMEMLIN/includeLIN/libmem/libmem.h"
 
@@ -21,6 +75,8 @@
 #include <map>
 #include <iomanip>
 #include <ctime>
+#include <thread>
+#include <chrono>
 
 // Define a single global signature variable
 const std::string GLOBAL_SIGNATURE = "48 8D 64 24 ? C6 05 ? ? ? ? ? 4C 8D 05";
@@ -94,20 +150,73 @@ void DisassembleMemoryRegion(lm_process_t* process, lm_address_t address, int in
     std::cout << "\nDisassembling memory around address: 0x" << std::hex << address << std::dec << "\n";
     std::cout << "----------------------------------------\n";
     
-    lm_inst_t* instructions = nullptr;
-    lm_size_t count = Disassemble(address, instruction_count, &instructions);
-    
-    if (count == 0 || !instructions) {
-        std::cout << "Failed to disassemble memory region.\n";
+    // Error checking - Try to read the memory first to verify it's accessible
+    uint8_t test_buffer[16] = {0};
+    if (!ReadMemory(process, address, test_buffer, sizeof(test_buffer))) {
+        std::cerr << "Error: Unable to read memory at address 0x" << std::hex << address 
+                 << std::dec << " - Memory may not be accessible\n";
+        std::cout << "----------------------------------------\n";
         return;
     }
     
-    for (lm_size_t i = 0; i < count; i++) {
-        std::cout << std::hex << "0x" << instructions[i].address << std::dec << ":\t";
-        std::cout << instructions[i].mnemonic << " " << instructions[i].op_str << "\n";
+    std::cout << "Memory preview at target address:\n";
+    for (size_t i = 0; i < sizeof(test_buffer); i++) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                 << static_cast<int>(test_buffer[i]) << " ";
+        if ((i+1) % 8 == 0) std::cout << "\n";
+    }
+    std::cout << std::dec << "\n";
+    
+    // Disassemble function until a 'ret' is found or instruction_count is reached
+    lm_address_t current_addr = address;
+    int instructions_found = 0;
+    
+    for (;;) {
+        // Disassemble one instruction at a time
+        lm_inst_t* instruction = nullptr;
+        // Use LM_GetArchitecture() instead of a hardcoded architecture constant
+        lm_size_t result = LM_DisassembleEx(current_addr, LM_GetArchitecture(), 0, 1, current_addr, &instruction);
+        
+        // Check if disassembly was successful
+        if (result == 0 || !instruction) {
+            std::cerr << "Failed to disassemble at address: 0x" 
+                      << std::hex << current_addr << std::dec << std::endl;
+            break;
+        }
+        
+        // Print address, instruction mnemonic and operands
+        std::cout << "0x" << std::hex << instruction->address << std::dec << ": ";
+        std::cout << instruction->mnemonic << " " << instruction->op_str;
+        
+        // Print bytes in format like [ 55 48 89 e5 ]
+        std::cout << " -> [ ";
+        for (lm_size_t i = 0; i < instruction->size; i++) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0') 
+                     << static_cast<int>(instruction->bytes[i]) << " ";
+        }
+        std::cout << "]" << std::dec << std::endl;
+        
+        // Check if this is a 'ret' instruction
+        if (strcmp(instruction->mnemonic, "ret") == 0) {
+            std::cout << "Found return instruction, stopping disassembly." << std::endl;
+            LM_FreeInstructions(instruction);
+            break;
+        }
+        
+        // Move to next instruction
+        current_addr += instruction->size;
+        
+        // Free the instruction memory
+        LM_FreeInstructions(instruction);
+        
+        // Increment counter and check if we've reached the limit
+        instructions_found++;
+        if (instructions_found >= instruction_count && instruction_count > 0) {
+            std::cout << "Reached instruction count limit." << std::endl;
+            break;
+        }
     }
     
-    LM_FreeInstructions(instructions);
     std::cout << "----------------------------------------\n";
 }
 
@@ -245,17 +354,40 @@ void ReadCustomAddress(lm_process_t* process) {
     ReadMemoryDword(process, address);
 }
 
-// Allow user to read a 4-byte value at a custom address in a loop
+// Cross-platform function to check if a key is available
+bool IsKeyAvailable() {
+#ifdef _WIN32
+    return _kbhit() != 0;
+#else
+    return kbhit();
+#endif
+}
+
+// Cross-platform function to get a character without blocking
+char GetChar() {
+#ifdef _WIN32
+    return _getch();
+#else
+    return getch();
+#endif
+}
+
+// Allow user to read a 4-byte value at a custom address in a loop with non-blocking input
 void ReadCustomAddressLoop(lm_process_t* process) {
     lm_address_t address;
     std::cout << "Enter memory address to monitor (in hex format, e.g., 0x12345678): ";
     std::cin >> std::hex >> address >> std::dec;
     
+    // Set terminal to raw mode on Linux
+#ifndef _WIN32
+    set_raw_mode(true);
+#endif
+
     std::cout << "Monitoring address 0x" << std::hex << address << std::dec << " (Press Ctrl+C to stop)...\n";
     std::cout << "Commands while monitoring:\n";
-    std::cout << "  Type 'f' to freeze/unfreeze the value\n";
-    std::cout << "  Type 'c' to change the value\n";
-    std::cout << "  Press Enter to continue monitoring\n";
+    std::cout << "  Press 'f' to freeze/unfreeze the value\n";
+    std::cout << "  Press 'c' to change the value\n";
+    std::cout << "  Press 'q' to quit monitoring\n";
     std::cout << "----------------------------------------\n";
     
     uint32_t prev_value = 0;
@@ -263,9 +395,9 @@ void ReadCustomAddressLoop(lm_process_t* process) {
     bool first_read = true;
     bool is_frozen = false;
     unsigned long long loop_count = 0;
-    char input_command;
+    bool running = true;
     
-    while (true) {
+    while (running) {
         uint32_t value = 0;
         bool success = ReadMemory(process, address, &value, sizeof(value));
 
@@ -301,9 +433,9 @@ void ReadCustomAddressLoop(lm_process_t* process) {
             break;
         }
         
-        // Check for user commands without blocking (non-blocking input)
-        if (std::cin.rdbuf()->in_avail() > 0) {
-            std::cin >> input_command;
+        // Check for user commands without blocking
+        if (IsKeyAvailable()) {
+            char input_command = GetChar();
             
             // Process command
             if (input_command == 'f' || input_command == 'F') {
@@ -319,6 +451,10 @@ void ReadCustomAddressLoop(lm_process_t* process) {
                     std::cout << "Value UNFROZEN\n";
                 }
             } else if (input_command == 'c' || input_command == 'C') {
+                // Return to normal input mode temporarily
+#ifndef _WIN32
+                set_raw_mode(false);
+#endif
                 // Allow changing the value
                 uint32_t current_value = is_frozen ? frozen_value : value;
                 
@@ -335,16 +471,29 @@ void ReadCustomAddressLoop(lm_process_t* process) {
                                   << std::setfill('0') << frozen_value << std::dec << "\n";
                     }
                 }
+                
+                // Return to raw input mode
+#ifndef _WIN32
+                set_raw_mode(true);
+#endif
+            } else if (input_command == 'q' || input_command == 'Q') {
+                // Exit the monitoring loop
+                running = false;
             }
-            
-            // Clear any remaining input
-            std::cin.clear();
-            std::cin.ignore(10000, '\n');
         }
+        
+        // Sleep briefly to avoid consuming 100% CPU
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
         
         // Increment loop counter for monitoring purposes
         loop_count++;
     }
+    
+    // Restore terminal settings when done
+#ifndef _WIN32
+    set_raw_mode(false);
+#endif
+    std::cout << "\nStopped monitoring address 0x" << std::hex << address << std::dec << "\n";
 }
 
 // Fix type mismatch in HandleModuleListingAndScanning
@@ -367,13 +516,13 @@ void HandleModuleListingAndScanning(lm_process_t& process) {
 // Function to write a value to memory in different formats
 bool WriteMemoryValue(lm_process_t* process, lm_address_t address, uint32_t* value_ptr) {
     std::cout << "\nSelect value format to write:\n";
+    std::cout << "0. Cancel\n";
     std::cout << "1. Hexadecimal (e.g., 0xA1B2C3D4)\n";
     std::cout << "2. Integer (e.g., -123456)\n";
     std::cout << "3. Unsigned integer (e.g., 3000000000)\n";
     std::cout << "4. Float (e.g., 3.14159)\n";
     std::cout << "5. Four bytes (e.g., FF AA BB CC)\n";
-    std::cout << "6. Cancel\n";
-    std::cout << "Enter your choice (1-6): ";
+    std::cout << "Enter your choice (0-5): ";
     
     int choice;
     std::cin >> choice;
@@ -382,6 +531,9 @@ bool WriteMemoryValue(lm_process_t* process, lm_address_t address, uint32_t* val
     bool valid_input = false;
     
     switch (choice) {
+        case 0: // Cancel
+            std::cout << "Operation cancelled.\n";
+            return false;
         case 1: { // Hex
             std::cout << "Enter new value in hex (e.g., AABBCCDD or 0xAABBCCDD): ";
             std::cin >> std::hex >> new_value >> std::dec;
@@ -430,9 +582,8 @@ bool WriteMemoryValue(lm_process_t* process, lm_address_t address, uint32_t* val
             std::cout << "Failed to write value to memory!\n";
             return false;
         }
-        case 6: // Cancel
         default:
-            std::cout << "Operation cancelled.\n";
+            std::cout << "Invalid choice.\n";
             return false;
     }
     
@@ -457,16 +608,19 @@ void ShowMainMenu(lm_process_t& process) {
     
     while (true) {
         std::cout << "\n===== MEMORY INTERFACE MAIN MENU =====\n";
+        std::cout << "0. Exit\n";
         std::cout << "1. List modules in process\n";
         std::cout << "2. Enter signature manually\n";
         std::cout << "3. Scan modules with default signature\n";
         std::cout << "4. Read memory at address\n";
         std::cout << "5. Monitor memory at address\n";
-        std::cout << "6. Exit\n";
-        std::cout << "Enter your choice (1-6): ";
+        std::cout << "Enter your choice (0-5): ";
         std::cin >> choice;
         
         switch (choice) {
+            case 0:
+                std::cout << "Exiting program...\n";
+                return;
             case 1: {
                 // List modules
                 std::map<std::string, lm_module_t> module_map;
@@ -507,9 +661,6 @@ void ShowMainMenu(lm_process_t& process) {
                 ReadCustomAddressLoop(&process);
                 break;
             }
-            case 6:
-                std::cout << "Exiting program...\n";
-                return;
             default:
                 std::cout << "Invalid choice, please try again.\n";
                 break;
