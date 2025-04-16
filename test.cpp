@@ -22,6 +22,12 @@ lm_bool_t ListProcessesCallback(lm_process_t* process, lm_void_t* arg) {
     return LM_TRUE; // Continue enumeration
 }
 
+Component Window(std::string title, Component component) {
+    return Renderer(component, [component, title] {
+        return window(text(title), component->Render()) | flex;
+    });
+}
+
 int main() {
     // Create the screen first
     auto screen = ScreenInteractive::Fullscreen();
@@ -32,74 +38,89 @@ int main() {
     // Enumerate processes
     LM_EnumProcesses(ListProcessesCallback, &process_map);
 
-    // Create table data
-    std::vector<std::vector<std::string>> table_data = {
-        {"PID", "Process Name", "Path"}
-    };
-
-    // Add processes to table data
+    // Create menu entries for processes
+    std::vector<std::string> process_entries;
     for (const auto& [pid, name] : process_map) {
-        table_data.push_back({
-            std::to_string(pid),
-            name,
-            "N/A"  // Path information would need additional API calls
-        });
+        process_entries.push_back("[" + std::to_string(pid) + "] " + name);
     }
 
-    // Create table
-    auto table = Table(table_data);
+    // Create menu entries for actions
+    std::vector<std::string> action_entries = {
+        "Scan Memory",
+        "Read Memory",
+        "Write Memory",
+        "List Modules",
+        "Scan Modules"
+    };
 
-    // Style the table
-    table.SelectAll().Border(LIGHT);
-    table.SelectColumn(0).Border(LIGHT);
-    table.SelectRow(0).Decorate(bold);
-    table.SelectRow(0).SeparatorVertical(LIGHT);
-    table.SelectRow(0).Border(DOUBLE);
+    // Create menu entries for display options
+    std::vector<std::string> display_entries = {
+        "Hex",
+        "Decimal",
+        "Float",
+        "Bytes"
+    };
 
-    // Add alternating row colors
-    auto content = table.SelectRows(1, -1);
-    content.DecorateCellsAlternateRow(color(Color::Blue), 3, 0);
-    content.DecorateCellsAlternateRow(color(Color::Cyan), 3, 1);
-    content.DecorateCellsAlternateRow(color(Color::White), 3, 2);
+    // Menu selections
+    int menu_selected[] = {0, 0, 0};
+    int menu_selected_global = 0;
 
-    // Create buttons
-    int selected = 0;
+    // Create menus
+    auto process_menu = Window("Process List", Menu(&process_entries, &menu_selected[0]));
+    auto action_menu = Window("Actions", Menu(&action_entries, &menu_selected[1]));
+    auto display_menu = Window("Display Options", Menu(&display_entries, &menu_selected[2]));
+
+    // Create vertical menu container
+    auto menu_global = Container::Vertical(
+        {
+            process_menu,
+            action_menu,
+            display_menu
+        },
+        &menu_selected_global
+    );
+
+    // Create info panel
+    auto info = Renderer([&] {
+        int g = menu_selected_global;
+        std::string value;
+        if (g == 0 && !process_entries.empty()) {
+            value = process_entries[menu_selected[0]];
+        } else if (g == 1) {
+            value = action_entries[menu_selected[1]];
+        } else if (g == 2) {
+            value = display_entries[menu_selected[2]];
+        }
+
+        return window(text("Information"), 
+            vbox({
+                text("Selected Menu: " + std::to_string(g)),
+                text("Process Selection: " + std::to_string(menu_selected[0])),
+                text("Action Selection: " + std::to_string(menu_selected[1])),
+                text("Display Selection: " + std::to_string(menu_selected[2])),
+                text("Selected Value: " + value),
+                text(""),
+                text("Use arrow keys to navigate"),
+                text("Enter to select"),
+                text("Tab to switch menus"),
+                text("q to quit")
+            })) | flex;
+    });
+
+    // Create refresh button
     auto refresh_button = Button("Refresh", [&] {
         process_map.clear();
         LM_EnumProcesses(ListProcessesCallback, &process_map);
-        
-        table_data.clear();
-        table_data.push_back({"PID", "Process Name", "Path"});
-        
+        process_entries.clear();
         for (const auto& [pid, name] : process_map) {
-            table_data.push_back({
-                std::to_string(pid),
-                name,
-                "N/A"
-            });
+            process_entries.push_back("[" + std::to_string(pid) + "] " + name);
         }
-        
-        table = Table(table_data);
-        // Reapply styling
-        table.SelectAll().Border(LIGHT);
-        table.SelectColumn(0).Border(LIGHT);
-        table.SelectRow(0).Decorate(bold);
-        table.SelectRow(0).SeparatorVertical(LIGHT);
-        table.SelectRow(0).Border(DOUBLE);
-        
-        auto content = table.SelectRows(1, -1);
-        content.DecorateCellsAlternateRow(color(Color::Blue), 3, 0);
-        content.DecorateCellsAlternateRow(color(Color::Cyan), 3, 1);
-        content.DecorateCellsAlternateRow(color(Color::White), 3, 2);
     });
 
-    auto exit_button = Button("Exit", [&] { screen.Exit(); });
+    // Create exit button
+    auto exit_button = Button("Exit", [&screen] { screen.Exit(); });
 
-    // Create layout
-    auto table_renderer = Renderer([&] {
-        return table.Render();
-    });
-
+    // Create button container
     auto buttons = Container::Horizontal({
         refresh_button,
         exit_button
@@ -113,13 +134,17 @@ int main() {
         });
     });
 
-    auto main_component = Container::Vertical({
-        table_renderer,
+    // Create main layout
+    auto global = Container::Vertical({
+        Container::Horizontal({
+            menu_global,
+            info
+        }),
         buttons_renderer
     });
 
     // Run the UI
-    screen.Loop(main_component);
+    screen.Loop(global);
 
     return 0;
 } 
