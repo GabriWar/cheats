@@ -1,0 +1,18 @@
+# Build directories
+build/
+out/
+bin/
+obj/
+
+# IDE specific files
+.vs/
+.vscode/
+*.user
+*.suo
+*.ncb
+*.opendb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb

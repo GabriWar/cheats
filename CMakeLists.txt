@@ -1,82 +1,82 @@
-cmake_minimum_required(VERSION 3.10)
-project(libmeminterface)
+cmake_minimum_required(VERSION 3.14)
+project(cheats)
 
 # Set C++ standard
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Force static linking
+# Enforce static linking
 set(BUILD_SHARED_LIBS OFF)
 set(CMAKE_EXE_LINK_DYNAMIC_CXX_STANDARD_LIBRARIES OFF)
 
-# Detect if we're cross-compiling
-if(CMAKE_CROSSCOMPILING)
-    message(STATUS "Cross-compiling for Windows")
-    set(IS_CROSS_COMPILE TRUE)
-else()
-    message(STATUS "Native build")
-    set(IS_CROSS_COMPILE FALSE)
-endif()
-
-# Set paths based on platform
+# Platform-specific settings
 if(WIN32)
-    set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMWIN/includeWIN/libmem")
+    # Windows (MinGW) specific settings
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static -static-libgcc -static-libstdc++")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
+    
+    # MinGW specific libraries
+    set(MINGW_LIBS -lws2_32 -lwinmm -lgdi32 -lcomdlg32 -lole32 -loleaut32 -luuid -lcomctl32 -lmsimg32)
+    
+    # Set libmem paths for Windows
+    set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMWIN/includeWIN")
     set(LIBMEM_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMWIN/libWIN/release")
-    set(LIBMEM_LIB_NAME "libmem")
-    set(LIBMEM_DLL "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMWIN/libWIN/release/libmem.dll")
+    set(LIBMEM_LIB_NAME "libmem.lib")
+    set(LIBMEM_DLL "libmem.dll")
 else()
-    set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMLIN/includeLIN/libmem")
+    # Linux specific settings
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libgcc -static-libstdc++")
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++")
+    
+    # Set libmem paths for Linux
+    set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMLIN/includeLIN")
     set(LIBMEM_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMLIN/libLIN")
-    set(LIBMEM_LIB_NAME "libmem")
+    set(LIBMEM_LIB_NAME "libmem.a")
 endif()
 
-# Add executable
-add_executable(test test.cpp)
+# Add FTXUI using FetchContent
+include(FetchContent)
+FetchContent_Declare(ftxui
+  GIT_REPOSITORY https://github.com/ArthurSonzogni/ftxui
+  GIT_TAG v6.0.2
+)
+
+FetchContent_MakeAvailable(ftxui)
+
+# Add executable targets
+add_executable(cheats test.cpp)
+add_executable(cheats_ui test.cpp)
 
 # Include directories
-target_include_directories(test PRIVATE ${LIBMEM_INCLUDE_DIR})
+target_include_directories(cheats PRIVATE ${LIBMEM_INCLUDE_DIR})
+target_include_directories(cheats_ui PRIVATE ${LIBMEM_INCLUDE_DIR})
 
-# Link libraries
-target_link_directories(test PRIVATE ${LIBMEM_LIB_DIR})
+# Link directories
+target_link_directories(cheats PRIVATE ${LIBMEM_LIB_DIR})
+target_link_directories(cheats_ui PRIVATE ${LIBMEM_LIB_DIR})
 
-# Set static linking options for all platforms
+# Link against FTXUI and other dependencies
+target_link_libraries(cheats PRIVATE ftxui::screen ftxui::dom ftxui::component)
+target_link_libraries(cheats_ui PRIVATE ftxui::screen ftxui::dom ftxui::component)
+
+# Platform-specific linking
 if(WIN32)
-    # For MinGW
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -static-libgcc -static-libstdc++ -static")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static-libgcc -static-libstdc++ -static")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static -Wl,--whole-archive -Wl,--no-whole-archive")
+    # Windows linking
+    target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
+    target_link_libraries(cheats_ui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
     
-    # Link libmem statically
-    target_link_libraries(test PRIVATE -Wl,--whole-archive ${LIBMEM_LIB_NAME} -Wl,--no-whole-archive)
-else()
-    # For GCC/MinGW
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
-    target_link_libraries(test PRIVATE -Wl,--whole-archive ${LIBMEM_LIB_NAME} -Wl,--no-whole-archive)
-endif()
-
-# Cross-compilation specific settings
-if(IS_CROSS_COMPILE)
-    # Add post-build command to verify static linking
-    add_custom_command(TARGET test POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E echo "Verifying static linking..."
-        COMMAND ${CMAKE_COMMAND} -E echo "If you see any .dll dependencies, static linking failed"
-        COMMAND ${CMAKE_COMMAND} -E echo "Dependencies:"
-        COMMAND x86_64-w64-mingw32-objdump -p $<TARGET_FILE:test> | findstr "DLL"
-        COMMENT "Verifying static linking"
-    )
-endif()
-
-# Copy DLL to build directory on Windows
-if(WIN32)
-    add_custom_command(TARGET test POST_BUILD
+    # Copy libmem.dll to output directory
+    add_custom_command(TARGET cheats POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${LIBMEM_DLL}"
-            $<TARGET_FILE_DIR:test>
-        COMMENT "Copying libmem.dll to output directory"
-    )
-endif()
-
-# Installation
-install(TARGETS test
-    RUNTIME DESTINATION bin
-) 
+        "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
+        $<TARGET_FILE_DIR:cheats>)
+    
+    add_custom_command(TARGET cheats_ui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
+        $<TARGET_FILE_DIR:cheats_ui>)
+else()
+    # Linux linking
+    target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
+    target_link_libraries(cheats_ui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
+endif() 
