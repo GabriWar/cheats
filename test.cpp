@@ -5,12 +5,15 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <chrono>                     // for milliseconds
+#include <thread>                     // for sleep_for
+#include <atomic>                     // for atomic
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/component/loop.hpp>  // Add this include for Loop class
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/component/component_options.hpp>
 #include <ftxui/screen/color.hpp>
-
 #ifdef _WIN32
     #include "LIBMEMWIN/includeWIN/libmem/libmem.hpp"
 #else
@@ -270,6 +273,179 @@ bool disassemble_memory_region(const libmem::Process& process, libmem::Address a
 }
 
 /**
+ * Continuously watch a memory region and display its value in various formats
+ * 
+ * @param process The process to read memory from
+ * @param address The address to monitor
+ * @param size The size of the memory region to monitor (defaults to 16 bytes)
+ * @return true if watching was completed successfully
+ */
+bool watch_memory_region(const libmem::Process& process, libmem::Address address, size_t size = 16) {
+    // Setup for terminal display
+    auto screen = ScreenInteractive::TerminalOutput();
+    
+    // Data for the UI
+    std::vector<uint8_t> memory_buffer(size, 0);
+    std::string status_message = "Watching memory at address: 0x" + std::to_string(address);
+    std::string hex_representation;
+    std::string int32_value;
+    std::string uint32_value;
+    std::string float_value;
+    std::string double_value;
+    std::string string_value;
+    int frame_count = 0;
+    bool read_success = false;
+    
+    // Flag to control the refresh thread - using shared_ptr for safe access
+    std::shared_ptr<std::atomic<bool>> should_quit = std::make_shared<std::atomic<bool>>(false);
+    
+    // Create a component that reads and displays memory values periodically
+    auto component = Renderer([&] {
+        // Update memory values on each render
+        size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), size);
+        read_success = (bytes_read == size);
+        frame_count++;
+        
+        // Format the memory for display in different formats
+        if (read_success) {
+            // Hex representation
+            hex_representation.clear();
+            for (size_t i = 0; i < size; i++) {
+                char hex_buff[4];
+                snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[i]);
+                hex_representation += hex_buff;
+                if ((i + 1) % 8 == 0) hex_representation += " ";
+            }
+            
+            // Integer representation (32-bit)
+            if (size >= 4) {
+                int32_t int_val = *reinterpret_cast<int32_t*>(memory_buffer.data());
+                int32_value = std::to_string(int_val);
+                uint32_t uint_val = *reinterpret_cast<uint32_t*>(memory_buffer.data());
+                uint32_value = std::to_string(uint_val);
+            }
+            
+            // Float representation
+            if (size >= 4) {
+                float float_val = *reinterpret_cast<float*>(memory_buffer.data());
+                float_value = std::to_string(float_val);
+            }
+            
+            // Double representation
+            if (size >= 8) {
+                double double_val = *reinterpret_cast<double*>(memory_buffer.data());
+                double_value = std::to_string(double_val);
+            }
+            
+            // String representation
+            string_value.clear();
+            for (size_t i = 0; i < size; i++) {
+                char c = memory_buffer[i];
+                if (c >= 32 && c <= 126) { // Printable ASCII
+                    string_value += c;
+                } else {
+                    string_value += '.';
+                }
+            }
+            
+            status_message = "Memory watch active - refresh #" + std::to_string(frame_count);
+        } else {
+            status_message = "Failed to read memory at address 0x" + std::to_string(address);
+        }
+        
+        // Module information for display
+        std::string address_info = "Address: 0x" + std::to_string(address);
+        
+        // Create the UI elements
+        Elements value_elements = {
+            text(" Memory values:") | bold | color(Color::Yellow),
+            text(" "),
+            hbox(text(" Hex bytes:    "), text(hex_representation) | bold),
+            hbox(text(" Int32:        "), text(int32_value) | bold),
+            hbox(text(" UInt32:       "), text(uint32_value) | bold),
+            hbox(text(" Float:        "), text(float_value) | bold),
+            hbox(text(" Double:       "), text(double_value) | bold),
+            hbox(text(" ASCII string: "), text(string_value) | bold),
+        };
+        
+        // Instructions
+        Elements instructions_elements = {
+            text(" Instructions:") | bold | color(Color::Yellow),
+            text(" "),
+            text(" Press Q or Esc to quit the memory watch")
+        };
+        
+        // Main document structure
+        return vbox({
+            text("Memory Watch") | bold | color(Color::Blue) | center,
+            text(address_info) | color(Color::Cyan) | center,
+            separator(),
+            text(" " + status_message) | color(read_success ? Color::Green : Color::Red),
+            separator(),
+            vbox(value_elements),
+            separator(),
+            vbox(instructions_elements)
+        }) | border;
+    });
+
+    // Add event handling for quitting
+    component |= CatchEvent([&, should_quit](Event event) {
+        // Quit on Escape or Q key
+        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
+            *should_quit = true;
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        if (event == Event::Escape) {
+            *should_quit = true;
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        return false;  // Pass other events through
+    });
+    
+    // Store the thread in a shared_ptr so we can safely join it later
+    std::shared_ptr<std::thread> refresh_thread = std::make_shared<std::thread>(
+        [should_quit, screen_ptr = std::addressof(screen)]() {
+            while (!*should_quit) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 times per second
+                
+                // Only post events if not quitting
+                if (!*should_quit) {
+                    try {
+                        // Use a weak pointer to make sure we don't call methods on a destroyed screen
+                        if (screen_ptr) {
+                            screen_ptr->Post([]() {
+                                // Request a new animation frame but don't refer to screen directly
+                                animation::RequestAnimationFrame();
+                            });
+                        }
+                    } catch (...) {
+                        // Safely ignore any exceptions during shutdown
+                        break;
+                    }
+                }
+            }
+        }
+    );
+    
+    // Run the main loop (this will block until Exit is called)
+    screen.Loop(component);
+    
+    // Signal the thread to quit
+    *should_quit = true;
+    
+    // Safely join the thread to ensure it's properly terminated before we exit
+    if (refresh_thread && refresh_thread->joinable()) {
+        refresh_thread->join();
+    }
+    
+    return read_success;
+}
+
+/**
  * Scan for a byte pattern in a module
  * 
  * @param process The process to scan
@@ -336,7 +512,7 @@ void scan_for_bytes(const libmem::Process& process, const std::optional<libmem::
     int action_selected = 0;
     std::vector<std::string> action_entries = {
         " Disassemble at match location",
-        " Read memory at match location",
+        " Watch memory at match location",
         " Back to module selection"
     };
     
@@ -402,21 +578,9 @@ void scan_for_bytes(const libmem::Process& process, const std::optional<libmem::
                 case 0: // Disassemble
                     disassemble_memory_region(process, result_address);
                     break;
-                case 1: { // Read memory
-                    // Read and display memory at the found address
-                    uint32_t value = 0;
-                    auto read_result = libmem::ReadMemory(&process, result_address, reinterpret_cast<uint8_t*>(&value), sizeof(value));
-                    if (read_result == sizeof(value)) {
-                        std::cout << "Memory at 0x" << std::hex << result_address << std::dec << ":" << std::endl;
-                        std::cout << "  Hex: 0x" << std::hex << value << std::dec << std::endl;
-                        std::cout << "  Int: " << static_cast<int32_t>(value) << std::endl;
-                        std::cout << "  UInt: " << value << std::endl;
-                        std::cout << "  Float: " << *reinterpret_cast<float*>(&value) << std::endl;
-                    } else {
-                        std::cout << "Failed to read memory at address 0x" << std::hex << result_address << std::dec << std::endl;
-                    }
-                    std::cout << "Press Enter to continue..." << std::endl;
-                    std::cin.get();
+                case 1: { // Watch memory
+                    // Watch memory at the found address (monitoring 16 bytes by default)
+                    watch_memory_region(process, result_address, 16);
                     break;
                 }
                 case 2: // Back
@@ -462,7 +626,7 @@ void scan_for_bytes(const libmem::Process& process, const std::optional<libmem::
                 text(" Instructions:") | bold | color(Color::Yellow),
                 text(" "),
                 text(" Enter a byte pattern using spaces between bytes"),
-                text(" Use '?' or '??' as wildcards for unknown bytes"),
+                text(" Use ? or ?? as wildcards for unknown bytes"),
                 text(" Example: 48 8D 64 24 ? C6 05 ? ? ? ? ?"),
                 separator(),
                 hbox(text(" "), back_button->Render())
