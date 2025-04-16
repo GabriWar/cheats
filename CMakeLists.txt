@@ -16,7 +16,7 @@ if(WIN32)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static -static-libgcc -static-libstdc++")
     
     # MinGW specific libraries
-    set(MINGW_LIBS -lws2_32 -lwinmm -lgdi32 -lcomdlg32 -lole32 -loleaut32 -luuid -lcomctl32 -lmsimg32)
+    set(MINGW_LIBS -lws2_32 -lwinmm -lgdi32 -lcomdlg32 -ole32 -loleaut32 -luuid -lcomctl32 -lmsimg32)
     
     # Set libmem paths for Windows
     set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMWIN/includeWIN")
@@ -31,7 +31,7 @@ else()
     # Set libmem paths for Linux
     set(LIBMEM_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMLIN/includeLIN")
     set(LIBMEM_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/LIBMEMLIN/libLIN")
-    set(LIBMEM_LIB_NAME "libmem.a")
+    set(LIBMEM_LIB_NAME "liblibmem.so")
 endif()
 
 # Add FTXUI using FetchContent
@@ -79,4 +79,4 @@ else()
     # Linux linking
     target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
     target_link_libraries(cheats_ui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
-endif() 
+endif()
