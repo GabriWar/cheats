@@ -3,6 +3,7 @@ build/
 out/
 bin/
 obj/
+build_mingw
 
 # IDE specific files
 .vs/
