@@ -45,25 +45,20 @@ FetchContent_MakeAvailable(ftxui)
 
 # Add executable targets
 add_executable(cheats test.cpp)
-add_executable(cheats_ui test.cpp)
 
 # Include directories
 target_include_directories(cheats PRIVATE ${LIBMEM_INCLUDE_DIR})
-target_include_directories(cheats_ui PRIVATE ${LIBMEM_INCLUDE_DIR})
 
 # Link directories
 target_link_directories(cheats PRIVATE ${LIBMEM_LIB_DIR})
-target_link_directories(cheats_ui PRIVATE ${LIBMEM_LIB_DIR})
 
 # Link against FTXUI and other dependencies
 target_link_libraries(cheats PRIVATE ftxui::screen ftxui::dom ftxui::component)
-target_link_libraries(cheats_ui PRIVATE ftxui::screen ftxui::dom ftxui::component)
 
 # Platform-specific linking
 if(WIN32)
     # Windows linking
     target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
-    target_link_libraries(cheats_ui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
     
     # Copy libmem.dll to output directory
     add_custom_command(TARGET cheats POST_BUILD
@@ -71,12 +66,7 @@ if(WIN32)
         "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
         $<TARGET_FILE_DIR:cheats>)
     
-    add_custom_command(TARGET cheats_ui POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
-        $<TARGET_FILE_DIR:cheats_ui>)
 else()
     # Linux linking
     target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
-    target_link_libraries(cheats_ui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
 endif()

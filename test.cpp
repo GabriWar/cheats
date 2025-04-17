@@ -54,6 +54,10 @@ struct SignatureScanResult {
     std::vector<libmem::Address> matches;
 };
 
+// Forward declarations of functions used in handle_module_menu
+void dump_module(const libmem::Process& process, const libmem::Module& module);
+void find_bytes(const libmem::Process& process, const std::optional<libmem::Module>& module = std::nullopt);
+
 /**
  * Parse a signature string into a format that libmem can understand.
  * Handles formats like "48 8D 64 24 ? C6 05" or "48 8D 64 24 ?? C6 05"
@@ -236,7 +240,7 @@ bool disassemble_memory_region(const libmem::Process& process, libmem::Address a
         return false;  // Pass other events through
     });
     
-    auto renderer = Renderer(container, [&] {
+    auto renderer_component = Renderer(container, [&]() -> Element {
         // Create elements for the UI
         Elements title_elements = {
             text("Memory Disassembly") | bold | color(Color::Blue) | center
@@ -268,12 +272,15 @@ bool disassemble_memory_region(const libmem::Process& process, libmem::Address a
         }) | border;
     });
     
-    screen.Loop(renderer);
+    // Run the UI loop
+    screen.Loop(renderer_component);
+    
     return disasm_success;
 }
 
 /**
  * Continuously watch a memory region and display its value in various formats
+ * With additional features to freeze and change values
  * 
  * @param process The process to read memory from
  * @param address The address to monitor
@@ -281,84 +288,360 @@ bool disassemble_memory_region(const libmem::Process& process, libmem::Address a
  * @return true if watching was completed successfully
  */
 bool watch_memory_region(const libmem::Process& process, libmem::Address address, size_t size = 16) {
-    // Setup for terminal display
-    auto screen = ScreenInteractive::TerminalOutput();
+    auto screen = ScreenInteractive::Fullscreen();
     
     // Data for the UI
     std::vector<uint8_t> memory_buffer(size, 0);
+    std::vector<uint8_t> frozen_buffer(size, 0);
     std::string status_message = "Watching memory at address: 0x" + std::to_string(address);
-    std::string hex_representation;
-    std::string int32_value;
-    std::string uint32_value;
-    std::string float_value;
-    std::string double_value;
-    std::string string_value;
-    int frame_count = 0;
     bool read_success = false;
+    bool freeze_value = false;
+    bool is_paused = false;
+    std::string hex_representation;
+    std::string int32_value = "N/A";
+    std::string uint32_value = "N/A";
+    std::string float_value = "N/A";
+    std::string double_value = "N/A";
+    std::string string_value;
     
-    // Flag to control the refresh thread - using shared_ptr for safe access
-    std::shared_ptr<std::atomic<bool>> should_quit = std::make_shared<std::atomic<bool>>(false);
+    // For changing values
+    std::string change_value_input;
+    int change_type_selected = 0;
+    std::vector<std::string> change_type_entries = {
+        " Int32",
+        " UInt32",
+        " Float",
+        " Double",
+        " Hex",
+        " String"
+    };
+    bool is_changing_value = false;
     
-    // Create a component that reads and displays memory values periodically
-    auto component = Renderer([&] {
-        // Update memory values on each render
-        size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), size);
-        read_success = (bytes_read == size);
-        frame_count++;
+    // Function to read and update memory values
+    auto update_memory_display = [&]() {
+        if (is_paused) {
+            return;
+        }
         
-        // Format the memory for display in different formats
-        if (read_success) {
+        // If frozen, continuously write the frozen value to memory
+        if (freeze_value && !frozen_buffer.empty()) {
+            // Write the frozen value back to memory to maintain the freeze
+            libmem::WriteMemory(&process, address, frozen_buffer.data(), size);
+            
+            // Verify the frozen value was written by reading back
+            std::vector<uint8_t> verify_buffer(size, 0);
+            size_t bytes_read = libmem::ReadMemory(&process, address, verify_buffer.data(), size);
+            read_success = (bytes_read == size);
+            
+            // Use frozen buffer for display to keep UI consistent
+            std::vector<uint8_t> display_buffer = frozen_buffer;
+            
+            // Format the memory for display
             // Hex representation
             hex_representation.clear();
             for (size_t i = 0; i < size; i++) {
                 char hex_buff[4];
-                snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[i]);
+                snprintf(hex_buff, sizeof(hex_buff), "%02X ", display_buffer[i]);
                 hex_representation += hex_buff;
                 if ((i + 1) % 8 == 0) hex_representation += " ";
             }
             
             // Integer representation (32-bit)
             if (size >= 4) {
-                int32_t int_val = *reinterpret_cast<int32_t*>(memory_buffer.data());
+                int32_t int_val = *reinterpret_cast<int32_t*>(display_buffer.data());
                 int32_value = std::to_string(int_val);
-                uint32_t uint_val = *reinterpret_cast<uint32_t*>(memory_buffer.data());
+                uint32_t uint_val = *reinterpret_cast<uint32_t*>(display_buffer.data());
                 uint32_value = std::to_string(uint_val);
             }
             
             // Float representation
             if (size >= 4) {
-                float float_val = *reinterpret_cast<float*>(memory_buffer.data());
+                float float_val = *reinterpret_cast<float*>(display_buffer.data());
                 float_value = std::to_string(float_val);
             }
             
             // Double representation
             if (size >= 8) {
-                double double_val = *reinterpret_cast<double*>(memory_buffer.data());
+                double double_val = *reinterpret_cast<double*>(display_buffer.data());
                 double_value = std::to_string(double_val);
             }
             
             // String representation
             string_value.clear();
             for (size_t i = 0; i < size; i++) {
-                char c = memory_buffer[i];
+                char c = display_buffer[i];
                 if (c >= 32 && c <= 126) { // Printable ASCII
                     string_value += c;
                 } else {
                     string_value += '.';
                 }
             }
-            
-            status_message = "Memory watch active - refresh #" + std::to_string(frame_count);
         } else {
-            status_message = "Failed to read memory at address 0x" + std::to_string(address);
+            // Read from process memory
+            size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), size);
+            read_success = (bytes_read == size);
+            
+            if (read_success) {
+                // Format the memory for display
+                // Hex representation
+                hex_representation.clear();
+                for (size_t i = 0; i < size; i++) {
+                    char hex_buff[4];
+                    snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[i]);
+                    hex_representation += hex_buff;
+                    if ((i + 1) % 8 == 0) hex_representation += " ";
+                }
+                
+                // Integer representation (32-bit)
+                if (size >= 4) {
+                    int32_t int_val = *reinterpret_cast<int32_t*>(memory_buffer.data());
+                    int32_value = std::to_string(int_val);
+                    uint32_t uint_val = *reinterpret_cast<uint32_t*>(memory_buffer.data());
+                    uint32_value = std::to_string(uint_val);
+                }
+                
+                // Float representation
+                if (size >= 4) {
+                    float float_val = *reinterpret_cast<float*>(memory_buffer.data());
+                    float_value = std::to_string(float_val);
+                }
+                
+                // Double representation
+                if (size >= 8) {
+                    double double_val = *reinterpret_cast<double*>(memory_buffer.data());
+                    double_value = std::to_string(double_val);
+                }
+                
+                // String representation
+                string_value.clear();
+                for (size_t i = 0; i < size; i++) {
+                    char c = memory_buffer[i];
+                    if (c >= 32 && c <= 126) { // Printable ASCII
+                        string_value += c;
+                    } else {
+                        string_value += '.';
+                    }
+                }
+            }
+        }
+    };
+    
+    // Function to toggle freeze state
+    auto toggle_freeze = [&]() {
+        if (!freeze_value) {
+            // Take a snapshot of current memory to freeze
+            frozen_buffer = memory_buffer;
+            freeze_value = true;
+            status_message = "Value frozen";
+        } else {
+            freeze_value = false;
+            status_message = "Value unfrozen";
+        }
+    };
+    
+    // Function to toggle pause state
+    auto toggle_pause = [&]() {
+        is_paused = !is_paused;
+        status_message = is_paused ? "Memory watching paused" : "Memory watching resumed";
+    };
+    
+    // Function to set a new value to memory
+    auto apply_value_change = [&](const std::string& input_value, int type_index) -> bool {
+        std::vector<uint8_t> new_value(size, 0);
+        bool success = false;
+        
+        try {
+            if (type_index == 0 && size >= 4) { // Int32
+                int32_t val = std::stoi(input_value);
+                *reinterpret_cast<int32_t*>(new_value.data()) = val;
+                success = true;
+            } else if (type_index == 1 && size >= 4) { // UInt32
+                uint32_t val = static_cast<uint32_t>(std::stoul(input_value));
+                *reinterpret_cast<uint32_t*>(new_value.data()) = val;
+                success = true;
+            } else if (type_index == 2 && size >= 4) { // Float
+                float val = std::stof(input_value);
+                *reinterpret_cast<float*>(new_value.data()) = val;
+                success = true;
+            } else if (type_index == 3 && size >= 8) { // Double
+                double val = std::stod(input_value);
+                *reinterpret_cast<double*>(new_value.data()) = val;
+                success = true;
+            } else if (type_index == 4) { // Hex
+                std::istringstream iss(input_value);
+                std::string byte_str;
+                size_t byte_idx = 0;
+                
+                while (iss >> byte_str && byte_idx < size) {
+                    try {
+                        uint8_t byte_val = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                        new_value[byte_idx++] = byte_val;
+                    } catch (...) {
+                        status_message = "Invalid hex value: " + byte_str;
+                        return false;
+                    }
+                }
+                success = true;
+            } else if (type_index == 5) { // String
+                size_t copy_size = std::min(input_value.size(), size);
+                std::copy(input_value.begin(), input_value.begin() + copy_size, new_value.begin());
+                success = true;
+            }
+        } catch (const std::exception& e) {
+            status_message = "Error parsing value: " + std::string(e.what());
+            return false;
         }
         
-        // Module information for display
-        std::string address_info = "Address: 0x" + std::to_string(address);
+        if (!success) {
+            status_message = "Failed to parse value";
+            return false;
+        }
         
-        // Create the UI elements
-        Elements value_elements = {
-            text(" Memory values:") | bold | color(Color::Yellow),
+        // Apply the change
+        if (freeze_value) {
+            // Just update the frozen buffer
+            frozen_buffer = new_value;
+            status_message = "Frozen value updated";
+            return true;
+        } else {
+            // Write directly to memory
+            size_t bytes_written = libmem::WriteMemory(&process, address, new_value.data(), size);
+            if (bytes_written == size) {
+                status_message = "Value changed successfully";
+                return true;
+            } else {
+                status_message = "Failed to write memory";
+                return false;
+            }
+        }
+    };
+    
+    // Create input for changing values
+    InputOption input_option;
+    input_option.on_enter = [&] {
+        // Always consume the Enter key to prevent newlines in the input field
+        if (is_changing_value && !change_value_input.empty()) {
+            if (apply_value_change(change_value_input, change_type_selected)) {
+                // Successfully changed value
+                is_changing_value = false;
+                change_value_input = ""; // Clear input after successful change
+            }
+        }
+        return true; // Always consume Enter key to prevent newlines
+    };
+    input_option.multiline = false; // Ensure input is single-line only
+    
+    auto input_component = Input(&change_value_input, "Enter new value", input_option);
+    
+    // Create type selection menu
+    auto type_menu = Menu(&change_type_entries, &change_type_selected);
+    
+    // Create container for change value UI
+    auto change_container = Container::Vertical({
+        type_menu,
+        input_component
+    });
+    
+    // Initial memory read
+    update_memory_display();
+    
+    // Flag to control auto-refresh
+    std::atomic<bool> should_quit(false);
+    
+    // Start a thread to update the memory display periodically
+    std::thread refresh_thread([&]() {
+        while (!should_quit) {
+            if (!is_paused) {
+                update_memory_display();
+                screen.PostEvent(Event::Custom);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    });
+    
+    // Event handler component
+    auto event_handler = CatchEvent([&](Event event) {
+        if (is_changing_value) {
+            // In change value mode
+            if (event == Event::Escape) {
+                is_changing_value = false;
+                change_value_input = ""; // Clear input on cancel
+                return true;
+            }
+            
+            if (event == Event::Return) {
+                if (!change_value_input.empty()) {
+                    if (apply_value_change(change_value_input, change_type_selected)) {
+                        // Successfully changed value
+                        is_changing_value = false;
+                        change_value_input = ""; // Clear input after successful change
+                    }
+                }
+                return true; // Always consume Enter key to prevent newlines
+            }
+            
+            // Let the input component handle other events
+            return false;
+        } else {
+            // In regular mode
+            // Freeze/Unfreeze on F key
+            if (event.is_character() && (event.character() == "f" || event.character() == "F")) {
+                toggle_freeze();
+                return true;
+            }
+            
+            // Change value on C key
+            if (event.is_character() && (event.character() == "c" || event.character() == "C")) {
+                is_changing_value = true;
+                // Pre-fill the input field with the current value based on type
+                switch (change_type_selected) {
+                    case 0: change_value_input = int32_value; break;
+                    case 1: change_value_input = uint32_value; break;
+                    case 2: change_value_input = float_value; break;
+                    case 3: change_value_input = double_value; break;
+                    case 4: change_value_input = hex_representation; break;
+                    case 5: change_value_input = string_value; break;
+                }
+                input_component->TakeFocus();
+                return true;
+            }
+            
+            // Pause/Resume on P key
+            if (event.is_character() && (event.character() == "p" || event.character() == "P")) {
+                toggle_pause();
+                return true;
+            }
+            
+            // Quit on Escape or Q key
+            if (event == Event::Escape || 
+                (event.is_character() && (event.character() == "q" || event.character() == "Q"))) {
+                should_quit = true;
+                screen.ExitLoopClosure()();
+                return true;
+            }
+            
+            return false;
+        }
+    });
+    
+    // Create the container with the event handler
+    auto component = Container::Vertical({}) | event_handler;
+    
+    // Create the renderer function
+    auto render_function = [&]() -> Element {
+        // Determine status colors
+        ftxui::Color status_color = read_success ? Color::Green : Color::Red;
+        ftxui::Color freeze_color = freeze_value ? Color::Red : Color::Green;
+        ftxui::Color pause_color = is_paused ? Color::Yellow : Color::Green;
+        
+        // Value display section
+        Elements memory_values = {
+            text(" Memory at address: 0x" + std::to_string(address)) | color(Color::Cyan) | bold,
+            text(" "),
+            hbox(text(" Status: "), 
+                 text(freeze_value ? "FROZEN" : "Live") | color(freeze_color),
+                 text(" | "),
+                 text(is_paused ? "PAUSED" : "Watching") | color(pause_color)),
             text(" "),
             hbox(text(" Hex bytes:    "), text(hex_representation) | bold),
             hbox(text(" Int32:        "), text(int32_value) | bold),
@@ -368,78 +651,64 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
             hbox(text(" ASCII string: "), text(string_value) | bold),
         };
         
-        // Instructions
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" Press Q or Esc to quit the memory watch")
+        // Status message
+        Elements status_elements = {
+            text(" Status: " + status_message) | color(status_color)
         };
         
-        // Main document structure
-        return vbox({
-            text("Memory Watch") | bold | color(Color::Blue) | center,
-            text(address_info) | color(Color::Cyan) | center,
-            separator(),
-            text(" " + status_message) | color(read_success ? Color::Green : Color::Red),
-            separator(),
-            vbox(value_elements),
-            separator(),
-            vbox(instructions_elements)
-        }) | border;
-    });
-
-    // Add event handling for quitting
-    component |= CatchEvent([&, should_quit](Event event) {
-        // Quit on Escape or Q key
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            *should_quit = true;
-            screen.ExitLoopClosure()();
-            return true;
-        }
+        // Instructions
+        Elements instruction_elements = {
+            text(" Instructions:") | bold | color(Color::Yellow),
+            text(" "),
+            text(" F: Freeze/Unfreeze value"),
+            text(" C: Change value"),
+            text(" P: Pause/Resume watching"),
+            text(" Esc/Q: Exit")
+        };
         
-        if (event == Event::Escape) {
-            *should_quit = true;
-            screen.ExitLoopClosure()();
-            return true;
+        if (is_changing_value) {
+            // Show value change UI
+            return vbox({
+                text("Memory Watch") | bold | color(Color::Blue) | center,
+                separator(),
+                vbox(memory_values),
+                separator(),
+                text(" Change Value") | bold | color(Color::Yellow),
+                text(" "),
+                text(" Select value type:"),
+                type_menu->Render(),
+                text(" "),
+                text(" Enter new value:"),
+                input_component->Render(),
+                text(" "),
+                text(" Press Enter to apply, Esc to cancel") | center,
+                separator(),
+                vbox(status_elements),
+            }) | border;
+        } else {
+            // Show regular memory watch UI
+            return vbox({
+                text("Memory Watch") | bold | color(Color::Blue) | center,
+                separator(),
+                vbox(memory_values),
+                separator(),
+                vbox(status_elements),
+                separator(),
+                vbox(instruction_elements)
+            }) | border;
         }
-        
-        return false;  // Pass other events through
-    });
+    };
     
-    // Store the thread in a shared_ptr so we can safely join it later
-    std::shared_ptr<std::thread> refresh_thread = std::make_shared<std::thread>(
-        [should_quit, screen_ptr = std::addressof(screen)]() {
-            while (!*should_quit) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100)); // 10 times per second
-                
-                // Only post events if not quitting
-                if (!*should_quit) {
-                    try {
-                        // Use a weak pointer to make sure we don't call methods on a destroyed screen
-                        if (screen_ptr) {
-                            screen_ptr->Post([]() {
-                                // Request a new animation frame but don't refer to screen directly
-                                animation::RequestAnimationFrame();
-                            });
-                        }
-                    } catch (...) {
-                        // Safely ignore any exceptions during shutdown
-                        break;
-                    }
-                }
-            }
-        }
-    );
+    // Create renderer component that uses our render function
+    auto renderer_component = Renderer(component, render_function);
     
-    // Run the main loop (this will block until Exit is called)
-    screen.Loop(component);
+    // Run the UI loop
+    screen.Loop(renderer_component);
     
-    // Signal the thread to quit
-    *should_quit = true;
-    
-    // Safely join the thread to ensure it's properly terminated before we exit
-    if (refresh_thread && refresh_thread->joinable()) {
-        refresh_thread->join();
+    // Cleanup
+    should_quit = true;
+    if (refresh_thread.joinable()) {
+        refresh_thread.join();
     }
     
     return read_success;
@@ -750,7 +1019,7 @@ ProcessAction show_process_actions(const libmem::Process& process, const std::op
 }
 
 /**
- * [WIP] Enter a specific memory address to examine
+ * Enter a specific memory address to examine
  * 
  * @param process The process to examine
  * @param module Optional module context
@@ -759,16 +1028,162 @@ void enter_memory_address(const libmem::Process& process, const std::optional<li
     // Create a fullscreen terminal
     auto screen = ScreenInteractive::Fullscreen();
     
-    std::cout << "Enter memory address for " << process.name;
-    if (module.has_value()) {
-        std::cout << " (module: " << module->name << ")";
-    }
-    std::cout << "..." << std::endl;
+    // Input and state variables
+    std::string address_input;
+    std::string status_message = "";
+    bool has_error = false;
+    bool has_address = false;
+    libmem::Address parsed_address = 0;
     
-    // TODO: Implement memory address examination functionality
-    std::cout << "Memory address examination not yet implemented." << std::endl;
-    std::cout << "Press Enter to continue..." << std::endl;
-    std::cin.get();
+    // Action selection
+    int action_selected = 0;
+    std::vector<std::string> action_entries = {
+        " Disassemble memory at address",
+        " Watch memory at address",
+        " Back to module selection"
+    };
+    
+    // Create input component for address
+    InputOption input_option;
+    input_option.on_enter = [&] {
+        try {
+            // Try to parse the address - support both decimal and hex
+            if (address_input.substr(0, 2) == "0x") {
+                parsed_address = std::stoull(address_input.substr(2), nullptr, 16);
+            } else {
+                parsed_address = std::stoull(address_input, nullptr, 0);
+            }
+            
+            // Validate the address (basic check)
+            if (parsed_address == 0) {
+                status_message = "Invalid address: cannot be zero";
+                has_error = true;
+                has_address = false;
+                return;
+            }
+            
+            status_message = "Address parsed: 0x" + std::to_string(parsed_address);
+            has_error = false;
+            has_address = true;
+        } catch (const std::exception& e) {
+            status_message = "Invalid address format: " + std::string(e.what());
+            has_error = true;
+            has_address = false;
+        }
+    };
+    auto address_input_component = Input(&address_input, "Enter memory address (e.g., 0x7FF45CB00000)", input_option);
+    
+    // Create action menu
+    auto action_menu = Menu(&action_entries, &action_selected);
+    
+    // Create container with the input and menu
+    auto container = Container::Vertical({
+        address_input_component,
+        action_menu
+    });
+    
+    // Add key event handling
+    container |= CatchEvent([&](Event event) {
+        // Back to previous menu on Escape or B key
+        if (event.is_character() && (event.character() == "b" || event.character() == "B")) {
+            action_selected = 2; // Back to module selection
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        // Quit on Q key
+        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
+            action_selected = -1; // Cancel
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        if (event == Event::Escape) {
+            action_selected = 2; // Back to module selection
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        // Select on Enter key if we have a valid address
+        if (event == Event::Return && action_menu->Focused() && has_address) {
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        return false;  // Pass other events through
+    });
+    
+    // Module information text
+    std::string module_info = module.has_value() ? 
+        module->name + " (Base: 0x" + std::to_string(module->base) + ")" : 
+        "All Modules";
+    
+    auto renderer = ftxui::Renderer(container, [&] {
+        // Title area
+        auto title = vbox({
+            text("Enter Memory Address - " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center,
+            text("Module: " + module_info) | color(Color::Cyan) | center
+        });
+        
+        // Input area
+        auto input_area = vbox({
+            text(" Enter a memory address to examine:") | color(Color::Yellow),
+            hbox(text(" "), address_input_component->Render() | flex)
+        });
+        
+        // Status message
+        auto status_area = text("");
+        if (!status_message.empty()) {
+            status_area = vbox({
+                separator(),
+                text(" " + status_message) | (has_error ? color(Color::Red) : color(Color::Green))
+            });
+        }
+        
+        // Action menu
+        auto action_area = text("");
+        if (has_address) {
+            action_area = vbox({
+                text(" Choose action:") | color(Color::Yellow),
+                action_menu->Render() | flex
+            });
+        }
+        
+        // Instructions
+        auto instructions = vbox({
+            text(" Instructions:") | bold | color(Color::Yellow),
+            text(" "),
+            text(" Enter: Parse address or select action"),
+            text(" Tab: Switch between input and menu"),
+            text(" Esc/B: Back to module list"),
+            text(" Q: Quit")
+        });
+        
+        // Main document structure
+        return vbox({
+            title,
+            separator(),
+            input_area,
+            status_area,
+            separator(),
+            action_area,
+            separator(),
+            instructions | size(HEIGHT, EQUAL, 6)
+        }) | border;
+    });
+    
+    screen.Loop(renderer);
+    
+    // Perform the selected action
+    if (has_address && action_selected >= 0 && action_selected < 2) {
+        if (action_selected == 0) {
+            // Disassemble memory
+            disassemble_memory_region(process, parsed_address);
+        } else if (action_selected == 1) {
+            // Watch memory
+            watch_memory_region(process, parsed_address);
+        }
+    }
 }
 
 /**
@@ -1243,6 +1658,242 @@ ModuleSelectionResult show_process_modules(libmem::Pid process_pid) {
     
     auto process = process_opt.value();
     return module_select(process);
+}
+
+void handle_module_menu(const libmem::Process& process, const std::vector<libmem::Module>& modules, int selected_module) {
+    auto screen = ScreenInteractive::Fullscreen();
+    
+    std::string input;
+    int entries_selected = 0;
+    std::vector<std::string> entries = {
+        " Dump module",
+        " Find bytes in memory",
+        " Disassemble memory region",
+        " Watch memory region",
+        " Enter memory address",
+        " Back to process list"
+    };
+    
+    auto container = Container::Vertical({
+        Menu(&entries, &entries_selected)
+    });
+    
+    container |= CatchEvent([&](Event event) {
+        if (event == Event::Escape || (event.is_character() && (event.character() == "b" || event.character() == "B"))) {
+            entries_selected = entries.size() - 1; // Back to process list
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
+            entries_selected = -1; // Exit program
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        if (event == Event::Return) {
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        return false;
+    });
+    
+    std::string module_name;
+    if (selected_module == -1) {
+        module_name = "All Modules";
+    } else {
+        module_name = modules[selected_module].name;
+    }
+    
+    auto renderer = Renderer(container, [&, module_name, process] {
+        return vbox({
+            text("Module Menu - " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center,
+            text("Selected Module: " + module_name) | color(Color::Cyan) | center,
+            separator(),
+            container->Render(),
+            separator(),
+            text(" Esc/B: Back to process list") | color(Color::Yellow),
+            text(" Q: Quit") | color(Color::Yellow)
+        }) | border;
+    });
+    
+    screen.Loop(renderer);
+    
+    // Handle menu selection
+    if (entries_selected >= 0) {
+        if (entries_selected == 0) {
+            // Dump module
+            if (selected_module != -1) {
+                dump_module(process, modules[selected_module]);
+            }
+        } else if (entries_selected == 1) {
+            // Find bytes
+            if (selected_module != -1) {
+                find_bytes(process, modules[selected_module]);
+            } else {
+                find_bytes(process, std::nullopt);
+            }
+        } else if (entries_selected == 2) {
+            // Disassemble memory region
+            if (selected_module != -1) {
+                disassemble_memory_region(process, modules[selected_module].base);
+            }
+        } else if (entries_selected == 3) {
+            // Watch memory region
+            if (selected_module != -1) {
+                watch_memory_region(process, modules[selected_module].base);
+            }
+        } else if (entries_selected == 4) {
+            // Enter memory address
+            if (selected_module != -1) {
+                enter_memory_address(process, modules[selected_module]);
+            } else {
+                enter_memory_address(process);
+            }
+        } else if (entries_selected == 5) {
+            // Back to process list - do nothing, loop will exit
+        }
+    }
+}
+
+/**
+ * Dump a module's information and memory to console
+ * 
+ * @param process The process containing the module
+ * @param module The module to dump
+ */
+void dump_module(const libmem::Process& process, const libmem::Module& module) {
+    auto screen = ScreenInteractive::Fullscreen();
+    
+    // Data for the UI
+    std::string status_message = "Dumping module: " + module.name;
+    std::vector<std::string> dump_lines;
+    
+    // Add module information
+    dump_lines.push_back("Module: " + module.name);
+    dump_lines.push_back("Path: " + module.path);
+    dump_lines.push_back("Base address: 0x" + std::to_string(module.base));
+    dump_lines.push_back("End address: 0x" + std::to_string(module.end));
+    dump_lines.push_back("Size: " + std::to_string(module.size) + " bytes");
+    dump_lines.push_back("");
+    
+    // Add memory preview of the first 1024 bytes or less
+    const size_t preview_size = std::min<size_t>(1024, module.size);
+    std::vector<uint8_t> memory_buffer(preview_size, 0);
+    size_t bytes_read = libmem::ReadMemory(&process, module.base, memory_buffer.data(), preview_size);
+    
+    if (bytes_read > 0) {
+        dump_lines.push_back("Memory preview (first " + std::to_string(bytes_read) + " bytes):");
+        
+        // Format the memory in rows of 16 bytes
+        for (size_t offset = 0; offset < bytes_read; offset += 16) {
+            std::stringstream line;
+            line << "0x" << std::hex << (module.base + offset) << ": ";
+            
+            // Hex representation
+            for (size_t i = 0; i < 16 && (offset + i) < bytes_read; i++) {
+                char hex_buff[4];
+                snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[offset + i]);
+                line << hex_buff;
+            }
+            
+            // Pad if less than 16 bytes
+            const size_t remaining = bytes_read - offset;
+            if (remaining < 16) {
+                for (size_t i = 0; i < (16 - remaining); i++) {
+                    line << "   ";
+                }
+                if (remaining <= 8) line << " "; // Extra space if we didn't print the second half
+            }
+            
+            // ASCII representation
+            line << " | ";
+            for (size_t i = 0; i < 16 && (offset + i) < bytes_read; i++) {
+                char c = memory_buffer[offset + i];
+                line << (c >= 32 && c <= 126 ? c : '.');
+            }
+            
+            dump_lines.push_back(line.str());
+            
+            // Limit the number of lines to display
+            if (dump_lines.size() >= 500) {
+                dump_lines.push_back("... (output truncated, module too large to display completely)");
+                break;
+            }
+        }
+    } else {
+        dump_lines.push_back("Failed to read module memory.");
+    }
+    
+    // Create components for the UI
+    int selected_line = 0;
+    auto dump_menu = Menu(&dump_lines, &selected_line);
+    
+    // Create container with the menu
+    auto container = Container::Vertical({
+        dump_menu
+    });
+    
+    // Add key event handling for quitting
+    container |= CatchEvent([&](Event event) {
+        // Quit on Escape, Q key, or Enter
+        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        if (event == Event::Escape || event == Event::Return) {
+            screen.ExitLoopClosure()();
+            return true;
+        }
+        
+        return false;  // Pass other events through
+    });
+    
+    auto renderer = Renderer(container, [&] {
+        // Create elements for the UI
+        Elements title_elements = {
+            text("Module Dump") | bold | color(Color::Blue) | center
+        };
+        
+        Elements status_elements = {
+            text(status_message) | color(Color::Green) | center
+        };
+        
+        Elements instructions_elements = {
+            text(" Instructions:") | bold | color(Color::Yellow),
+            text(" "),
+            text(" ↑/↓ : Scroll dump"),
+            text(" Enter/Esc/Q : Return to previous screen")
+        };
+        
+        // Main document structure
+        return vbox({
+            vbox(title_elements),
+            separator(),
+            vbox(status_elements),
+            separator(),
+            hbox({
+                dump_menu->Render() | flex,
+                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
+            }),
+            separator(),
+            text(" Press any key to return") | center
+        }) | border;
+    });
+    
+    screen.Loop(renderer);
+}
+
+/**
+ * Find bytes in process memory (alias for scan_for_bytes)
+ * 
+ * @param process The process to scan
+ * @param module Optional module to limit the scan to
+ */
+void find_bytes(const libmem::Process& process, const std::optional<libmem::Module>& module) {
+    scan_for_bytes(process, module);
 }
 
 int main() {
