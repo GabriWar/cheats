@@ -43,30 +43,51 @@ FetchContent_Declare(ftxui
 
 FetchContent_MakeAvailable(ftxui)
 
+# Find all source files in utils directory
+file(GLOB UTILS_SOURCES "utils/*.cpp")
+
 # Add executable targets
-add_executable(cheats test.cpp)
+add_executable(cheats 
+    test.cpp
+    ${UTILS_SOURCES}
+)
 
-# Include directories
+# Add TUI executable
+add_executable(cheats_tui
+    test_tui.cpp
+)
+
+# Include directories for both executables
 target_include_directories(cheats PRIVATE ${LIBMEM_INCLUDE_DIR})
+target_include_directories(cheats_tui PRIVATE ${LIBMEM_INCLUDE_DIR})
 
-# Link directories
+# Link directories for both executables
 target_link_directories(cheats PRIVATE ${LIBMEM_LIB_DIR})
+target_link_directories(cheats_tui PRIVATE ${LIBMEM_LIB_DIR})
 
-# Link against FTXUI and other dependencies
+# Link against FTXUI and other dependencies for both executables
 target_link_libraries(cheats PRIVATE ftxui::screen ftxui::dom ftxui::component)
+target_link_libraries(cheats_tui PRIVATE ftxui::screen ftxui::dom ftxui::component)
 
-# Platform-specific linking
+# Platform-specific linking for cheats executable
 if(WIN32)
     # Windows linking
     target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
+    target_link_libraries(cheats_tui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}" ${MINGW_LIBS})
     
-    # Copy libmem.dll to output directory
+    # Copy libmem.dll to output directory for both executables
     add_custom_command(TARGET cheats POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
         $<TARGET_FILE_DIR:cheats>)
     
+    add_custom_command(TARGET cheats_tui POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${LIBMEM_LIB_DIR}/${LIBMEM_DLL}"
+        $<TARGET_FILE_DIR:cheats_tui>)
+    
 else()
-    # Linux linking
+    # Linux linking for both executables
     target_link_libraries(cheats PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
+    target_link_libraries(cheats_tui PRIVATE "${LIBMEM_LIB_DIR}/${LIBMEM_LIB_NAME}")
 endif()
