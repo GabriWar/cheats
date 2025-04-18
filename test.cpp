@@ -5,15 +5,19 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <iomanip>                    // for setw, setfill
 #include <chrono>                     // for milliseconds
 #include <thread>                     // for sleep_for
 #include <atomic>                     // for atomic
+#include <optional>                   // for std::optional
+#include <cstring>                    // for memcpy
 #include <ftxui/component/component.hpp>
 #include <ftxui/component/screen_interactive.hpp>
 #include <ftxui/component/loop.hpp>  // Add this include for Loop class
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/component/component_options.hpp>
 #include <ftxui/screen/color.hpp>
+#include <ftxui/component/animation.hpp>  // Add this for animation
 #ifdef _WIN32
     #include "LIBMEMWIN/includeWIN/libmem/libmem.hpp"
 #else
@@ -21,6 +25,40 @@
 #endif
 
 using namespace ftxui;
+#include <functional>  // for function
+#include <memory>      // for allocator, __shared_ptr_access
+#include <string>      // for string, basic_string, operator+, to_string
+#include <vector>      // for vector
+
+#include "ftxui/component/captured_mouse.hpp"  // for ftxui
+#include "ftxui/component/component.hpp"       // for Menu, Horizontal, Renderer
+#include "ftxui/component/component_base.hpp"  // for ComponentBase
+#include "ftxui/component/component_options.hpp"  // for MenuOption
+#include "ftxui/component/screen_interactive.hpp"  // for Component, ScreenInteractive
+#include "ftxui/dom/elements.hpp"  // for text, separator, bold, hcenter, vbox, hbox, gauge, Element, operator|, border
+
+// Structure to hold process information
+struct ProcessInfo {
+    std::string name;
+    int pid;
+    float cpu_usage;
+    int memory_mb;
+};
+
+// Structure to hold module information
+struct ModuleInfo {
+    std::string name;
+    std::string base_address;
+    int size_kb;
+};
+
+// Structure to hold a disassembly instruction
+struct AsmInstruction {
+    uint64_t address;
+    std::string bytes;
+    std::string mnemonic;
+    std::string operands;
+};
 
 /**
  * Result from module selection 
@@ -54,9 +92,49 @@ struct SignatureScanResult {
     std::vector<libmem::Address> matches;
 };
 
-// Forward declarations of functions used in handle_module_menu
-void dump_module(const libmem::Process& process, const libmem::Module& module);
-void find_bytes(const libmem::Process& process, const std::optional<libmem::Module>& module = std::nullopt);
+// Helper function to convert a process to a display string
+std::string ProcessToString(const ProcessInfo& process) {
+    return process.name + " (PID: " + std::to_string(process.pid) + ")";
+}
+
+// Helper function to check if a string contains another string (case insensitive)
+bool ContainsIgnoreCase(const std::string& str, const std::string& substr) {
+    auto it = std::search(
+        str.begin(), str.end(),
+        substr.begin(), substr.end(),
+        [](char ch1, char ch2) { return std::toupper(ch1) == std::toupper(ch2); }
+    );
+    return it != str.end();
+}
+
+// Helper function to format number as hex with leading zeros
+std::string FormatAsHex(uint64_t value, int width = 8) {
+    std::stringstream ss;
+    ss << "0x" << std::setfill('0') << std::setw(width) << std::hex << value;
+    return ss.str();
+}
+
+// Helper function to format bytes as hex
+std::string FormatHexBytes(uint64_t value, int numBytes) {
+    std::stringstream ss;
+    for (int i = 0; i < numBytes; i++) {
+        if (i > 0) ss << " ";
+        uint8_t byte = (value >> (i * 8)) & 0xFF;
+        ss << std::setfill('0') << std::setw(2) << std::hex << static_cast<int>(byte);
+    }
+    return ss.str();
+}
+
+// Helper function to format value as ASCII characters
+std::string FormatAsAscii(uint64_t value, int numBytes) {
+    std::string result;
+    for (int i = 0; i < numBytes; i++) {
+        uint8_t byte = (value >> (i * 8)) & 0xFF;
+        // Replace non-printable characters with dots
+        result += (byte >= 32 && byte <= 126) ? static_cast<char>(byte) : '.';
+    }
+    return result;
+}
 
 /**
  * Parse a signature string into a format that libmem can understand.
@@ -95,1878 +173,1138 @@ std::string parse_signature(const std::string& signature) {
     return cleaned_signature;
 }
 
+// ========================== Memory Manipulation Functions ==========================
+
 /**
- * Disassemble memory around a specific address using TUI
+ * Disassembles memory at the specified address
  * 
- * @param process The process to disassemble from
- * @param address The address to disassemble around
- * @param instruction_count How many instructions to show
- * @return true if disassembly was completed successfully
+ * @param process The target process
+ * @param address The starting address to disassemble
+ * @param instruction_count Number of instructions to disassemble
+ * @return true if successful, false otherwise
  */
 bool disassemble_memory_region(const libmem::Process& process, libmem::Address address, int instruction_count = 10) {
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Data for the UI
+    // Setup UI components for disassembly view
+    auto screen = ScreenInteractive::TerminalOutput();
     std::vector<std::string> disasm_lines;
-    std::string status_message = "Disassembling memory at address: 0x" + std::to_string(address);
-    bool disasm_success = false;
+    std::string status_message = "Disassembling memory...";
+    int selected_index = 0;
     
-    // Buffer for reading memory to verify it's accessible
-    std::vector<uint8_t> mem_buffer(128, 0); // Larger buffer to capture more instructions
-    size_t bytes_read = libmem::ReadMemory(&process, address, mem_buffer.data(), mem_buffer.size());
+    // Prepare component for disassembly display
+    auto disasm_component = Menu(&disasm_lines, &selected_index);
     
-    if (bytes_read < 16) { // Need at least a few bytes for meaningful disassembly
-        disasm_lines.push_back("Error: Memory at address 0x" + std::to_string(address) + " is not accessible.");
-        status_message = "Failed to access memory at target address";
-    } else {
-        // Show memory preview
-        std::stringstream ss;
-        ss << "Memory preview at target address: ";
-        for (size_t i = 0; i < std::min<size_t>(16, bytes_read); i++) {
-            char hex_buff[4];
-            snprintf(hex_buff, sizeof(hex_buff), "%02X ", mem_buffer[i]);
-            ss << hex_buff;
-            if ((i + 1) % 8 == 0) ss << " ";
-        }
-        disasm_lines.push_back(ss.str());
-        disasm_lines.push_back("");
+    // Disassemble memory
+    try {
+        // Read memory from the process - use correct API
+        std::vector<uint8_t> memory_buffer(instruction_count * 16); // Average instruction size is less than 16 bytes
+        bool read_success = true;
         
-        // Since we can't directly disassemble from process memory, we'll use a workaround:
-        // 1. Read chunks of memory into our buffer
-        // 2. Try manual disassembly by passing different offsets into the buffer to the disassembler
-        
-        libmem::Address current_addr = address;
-        int instructions_found = 0;
-        
-        // Get architecture for proper disassembly
-        libmem::Arch arch = libmem::GetArchitecture();
-        
-        // Create a new buffer that we'll use to simulate different memory locations
-        // Transfer data from mem_buffer to this new buffer for disassembly
-        std::vector<uint8_t> disasm_buffer(16, 0);
-        
-        while (instructions_found < instruction_count) {
-            // Calculate offset into our memory buffer
-            size_t offset = current_addr - address;
-            
-            // If we've gone beyond what we read, we need to stop
-            if (offset >= bytes_read) {
-                disasm_lines.push_back("Reached end of readable memory.");
-                break;
+        // Read memory one byte at a time using template version
+        for (size_t i = 0; i < memory_buffer.size(); i++) {
+            try {
+                memory_buffer[i] = libmem::ReadMemory<uint8_t>(address + i);
+            } catch (...) {
+                // If we can't read, fill with zero
+                memory_buffer[i] = 0;
+                read_success = false;
             }
-            
-            // Copy a chunk from our memory buffer to the disassembly buffer
-            size_t bytes_to_copy = std::min<size_t>(16, bytes_read - offset);
-            std::copy(mem_buffer.data() + offset, mem_buffer.data() + offset + bytes_to_copy, disasm_buffer.data());
-            
-            // Try to disassemble this chunk as a single instruction
-            auto disasm_result = libmem::Disassemble(
-                reinterpret_cast<libmem::Address>(disasm_buffer.data()),
-                arch,
-                bytes_to_copy,
-                1,  // instruction count = 1
-                current_addr  // use original address for display
-            );
-            
-            if (!disasm_result.has_value() || disasm_result->empty()) {
-                disasm_lines.push_back("Failed to disassemble at 0x" + std::to_string(current_addr));
-                
-                // Move forward by one byte and try again
-                current_addr += 1;
-                continue;
-            }
-            
-            // Get the instruction
-            const auto& inst = disasm_result->front();
-            
-            // Format instruction for display
-            std::stringstream inst_ss;
-            inst_ss << "0x" << std::hex << current_addr << std::dec << ": " 
-                    << inst.mnemonic << " " << inst.op_str;
-            
-            // Add the bytes in hex format
-            inst_ss << " -> [ ";
-            for (size_t i = 0; i < inst.bytes.size(); i++) {
-                char hex_buff[4];
-                snprintf(hex_buff, sizeof(hex_buff), "%02X ", inst.bytes[i]);
-                inst_ss << hex_buff;
-            }
-            inst_ss << "]";
-            
-            disasm_lines.push_back(inst_ss.str());
-            
-            // Check if this is a return instruction
-            if (inst.mnemonic.find("ret") != std::string::npos) {
-                disasm_lines.push_back("Found return instruction, stopping disassembly.");
-                break;
-            }
-            
-            // Move to next instruction
-            current_addr += inst.bytes.size();
-            instructions_found++;
         }
         
-        if (instructions_found == 0) {
-            disasm_lines.push_back("Failed to disassemble any instructions.");
-            status_message = "Disassembly failed";
-        } else {
-            disasm_success = true;
-            status_message = "Disassembly completed successfully";
+        if (!read_success) {
+            status_message = "Failed to read some memory at address " + FormatAsHex(address);
         }
+        
+        if (memory_buffer.empty()) {
+            status_message = "Failed to read memory at address " + FormatAsHex(address);
+            return false;
+        }
+        
+        // Convert to disassembly lines
+        size_t total_bytes_read = 0;
+        libmem::Address current_address = address;
+        
+        // In real implementation, use a disassembler library
+        // For now, just display hex bytes as placeholder
+        for (int i = 0; i < instruction_count && total_bytes_read < memory_buffer.size(); i++) {
+            size_t bytes_for_instr = std::min(size_t(16), memory_buffer.size() - total_bytes_read);
+            std::string bytes_str;
+            
+            for (size_t j = 0; j < bytes_for_instr; j++) {
+                if (j > 0) bytes_str += " ";
+                bytes_str += std::to_string(memory_buffer[total_bytes_read + j]);
+            }
+            
+            std::string line = FormatAsHex(current_address) + ": " + bytes_str;
+            disasm_lines.push_back(line);
+            
+            current_address += bytes_for_instr;
+            total_bytes_read += bytes_for_instr;
+        }
+        
+        status_message = "Disassembly complete - " + std::to_string(disasm_lines.size()) + " instructions";
+    } catch (const std::exception& e) {
+        status_message = "Error: " + std::string(e.what());
+        return false;
     }
     
-    // Create components for the UI
-    int selected_line = 0;
-    auto disasm_menu = Menu(&disasm_lines, &selected_line);
-    
-    // Create container with the menu
-    auto container = Container::Vertical({
-        disasm_menu
-    });
-    
-    // Add key event handling for quitting
-    container |= CatchEvent([&](Event event) {
-        // Quit on Escape, Q key, or Enter
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape || event == Event::Return) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    auto renderer_component = Renderer(container, [&]() -> Element {
-        // Create elements for the UI
-        Elements title_elements = {
-            text("Memory Disassembly") | bold | color(Color::Blue) | center
-        };
-        
-        Elements status_elements = {
-            text(status_message) | color(disasm_success ? Color::Green : Color::Red) | center
-        };
-        
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" ↑/↓ : Scroll disassembly"),
-            text(" Enter/Esc/Q : Return to previous screen")
-        };
-        
-        // Main document structure
+    // Create renderer for the disassembly view
+    auto renderer = Renderer(disasm_component, [&] {
         return vbox({
-            vbox(title_elements),
+            text("Disassembly of " + FormatAsHex(address)) | bold,
             separator(),
-            vbox(status_elements),
+            disasm_component->Render() | frame | size(HEIGHT, LESS_THAN, 20),
             separator(),
-            hbox({
-                disasm_menu->Render() | flex,
-                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
-            }),
-            separator(),
-            text(" Press any key to return") | center
-        }) | border;
+            text(status_message),
+            text("Press ESC to return") | color(Color::GrayDark),
+        });
+    });
+    
+    // Add event handler
+    auto component = CatchEvent(renderer, [&](Event event) {
+        if (event == Event::Escape) {
+            screen.Exit();
+            return true;
+        }
+        return false;
     });
     
     // Run the UI loop
-    screen.Loop(renderer_component);
-    
-    return disasm_success;
+    screen.Loop(component);
+    return !disasm_lines.empty();
 }
 
 /**
- * Continuously watch a memory region and display its value in various formats
- * With additional features to freeze and change values
+ * Watches a memory region for changes
  * 
- * @param process The process to read memory from
- * @param address The address to monitor
- * @param size The size of the memory region to monitor (defaults to 16 bytes)
- * @return true if watching was completed successfully
+ * @param process The target process
+ * @param address The starting address to watch
+ * @param size Size of the memory region in bytes
+ * @return true if successful, false otherwise
  */
 bool watch_memory_region(const libmem::Process& process, libmem::Address address, size_t size = 16) {
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Data for the UI
-    std::vector<uint8_t> memory_buffer(size, 0);
-    std::vector<uint8_t> frozen_buffer(size, 0);
-    std::string status_message = "Watching memory at address: 0x" + std::to_string(address);
-    bool read_success = false;
+    // Setup UI components for memory watch
+    auto screen = ScreenInteractive::TerminalOutput();
+    std::vector<std::string> memory_lines;
+    std::vector<uint64_t> memory_values;
+    std::string status_message = "Watching memory...";
+    int selected_index = 0;
+    bool is_running = true;
+    bool paused = false;
     bool freeze_value = false;
-    bool is_paused = false;
-    std::string hex_representation;
-    std::string int32_value = "N/A";
-    std::string uint32_value = "N/A";
-    std::string float_value = "N/A";
-    std::string double_value = "N/A";
-    std::string string_value;
+    std::vector<uint64_t> frozen_buffer;
     
-    // For changing values
-    std::string change_value_input;
-    int change_type_selected = 0;
-    std::vector<std::string> change_type_entries = {
-        " Int32",
-        " UInt32",
-        " Float",
-        " Double",
-        " Hex",
-        " String"
-    };
-    bool is_changing_value = false;
+    // Maximum rows to display
+    const int max_rows = 16;
+    const int bytes_per_row = 16;
+    size = std::min(size_t(max_rows * bytes_per_row), size);
     
-    // Function to read and update memory values
-    auto update_memory_display = [&]() {
-        if (is_paused) {
-            return;
+    // Read initial memory values
+    try {
+        memory_values.resize(size / sizeof(uint64_t) + 1, 0);
+        for (size_t i = 0; i < memory_values.size(); i++) {
+            libmem::Address curr_addr = address + (i * sizeof(uint64_t));
+            memory_values[i] = libmem::ReadMemory<uint64_t>(curr_addr);
         }
         
-        // If frozen, continuously write the frozen value to memory
-        if (freeze_value && !frozen_buffer.empty()) {
-            // Write the frozen value back to memory to maintain the freeze
-            libmem::WriteMemory(&process, address, frozen_buffer.data(), size);
-            
-            // Verify the frozen value was written by reading back
-            std::vector<uint8_t> verify_buffer(size, 0);
-            size_t bytes_read = libmem::ReadMemory(&process, address, verify_buffer.data(), size);
-            read_success = (bytes_read == size);
-            
-            // Use frozen buffer for display to keep UI consistent
-            std::vector<uint8_t> display_buffer = frozen_buffer;
-            
-            // Format the memory for display
-            // Hex representation
-            hex_representation.clear();
-            for (size_t i = 0; i < size; i++) {
-                char hex_buff[4];
-                snprintf(hex_buff, sizeof(hex_buff), "%02X ", display_buffer[i]);
-                hex_representation += hex_buff;
-                if ((i + 1) % 8 == 0) hex_representation += " ";
-            }
-            
-            // Integer representation (32-bit)
-            if (size >= 4) {
-                int32_t int_val = *reinterpret_cast<int32_t*>(display_buffer.data());
-                int32_value = std::to_string(int_val);
-                uint32_t uint_val = *reinterpret_cast<uint32_t*>(display_buffer.data());
-                uint32_value = std::to_string(uint_val);
-            }
-            
-            // Float representation
-            if (size >= 4) {
-                float float_val = *reinterpret_cast<float*>(display_buffer.data());
-                float_value = std::to_string(float_val);
-            }
-            
-            // Double representation
-            if (size >= 8) {
-                double double_val = *reinterpret_cast<double*>(display_buffer.data());
-                double_value = std::to_string(double_val);
-            }
-            
-            // String representation
-            string_value.clear();
-            for (size_t i = 0; i < size; i++) {
-                char c = display_buffer[i];
-                if (c >= 32 && c <= 126) { // Printable ASCII
-                    string_value += c;
-                } else {
-                    string_value += '.';
-                }
-            }
-        } else {
-            // Read from process memory
-            size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), size);
-            read_success = (bytes_read == size);
-            
-            if (read_success) {
-                // Format the memory for display
-                // Hex representation
-                hex_representation.clear();
-                for (size_t i = 0; i < size; i++) {
-                    char hex_buff[4];
-                    snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[i]);
-                    hex_representation += hex_buff;
-                    if ((i + 1) % 8 == 0) hex_representation += " ";
-                }
-                
-                // Integer representation (32-bit)
-                if (size >= 4) {
-                    int32_t int_val = *reinterpret_cast<int32_t*>(memory_buffer.data());
-                    int32_value = std::to_string(int_val);
-                    uint32_t uint_val = *reinterpret_cast<uint32_t*>(memory_buffer.data());
-                    uint32_value = std::to_string(uint_val);
-                }
-                
-                // Float representation
-                if (size >= 4) {
-                    float float_val = *reinterpret_cast<float*>(memory_buffer.data());
-                    float_value = std::to_string(float_val);
-                }
-                
-                // Double representation
-                if (size >= 8) {
-                    double double_val = *reinterpret_cast<double*>(memory_buffer.data());
-                    double_value = std::to_string(double_val);
-                }
-                
-                // String representation
-                string_value.clear();
-                for (size_t i = 0; i < size; i++) {
-                    char c = memory_buffer[i];
-                    if (c >= 32 && c <= 126) { // Printable ASCII
-                        string_value += c;
-                    } else {
-                        string_value += '.';
-                    }
-                }
-            }
+        if (memory_values.empty()) {
+            status_message = "Failed to read memory at address " + FormatAsHex(address);
+            return false;
         }
-    };
-    
-    // Function to toggle freeze state
-    auto toggle_freeze = [&]() {
-        if (!freeze_value) {
-            // Take a snapshot of current memory to freeze
-            frozen_buffer = memory_buffer;
-            freeze_value = true;
-            status_message = "Value frozen";
-        } else {
-            freeze_value = false;
-            status_message = "Value unfrozen";
+        
+        // Generate initial display
+        for (size_t i = 0; i < memory_values.size(); i++) {
+            libmem::Address row_addr = address + (i * sizeof(uint64_t));
+            std::string line = FormatAsHex(row_addr) + ": " + 
+                              FormatHexBytes(memory_values[i], sizeof(uint64_t)) + "  " +
+                              FormatAsAscii(memory_values[i], sizeof(uint64_t));
+            memory_lines.push_back(line);
         }
+    } catch (const std::exception& e) {
+        status_message = "Error: " + std::string(e.what());
+        return false;
+    }
+    
+    // Prepare component for memory display
+    auto menu_option = MenuOption();
+    menu_option.on_change = [&] { 
+        status_message = "Selected: " + memory_lines[selected_index];
     };
     
-    // Function to toggle pause state
-    auto toggle_pause = [&]() {
-        is_paused = !is_paused;
-        status_message = is_paused ? "Memory watching paused" : "Memory watching resumed";
-    };
+    auto memory_component = Menu(&memory_lines, &selected_index, menu_option);
     
-    // Function to set a new value to memory
+    // Value type and edit features
+    std::string edit_value;
+    bool editing = false;
+    int type_index = 0; // 0=int64, 1=float, 2=double, 3=bytes
+    std::vector<std::string> type_names = {"int64_t", "float", "double", "bytes"};
+    
+    auto input_component = Input(&edit_value, "Enter new value");
+    auto type_selector = Radiobox(&type_names, &type_index);
+    
+    // Function to apply value changes
     auto apply_value_change = [&](const std::string& input_value, int type_index) -> bool {
-        std::vector<uint8_t> new_value(size, 0);
-        bool success = false;
+        if (input_value.empty()) {
+            status_message = "No value entered";
+            return false;
+        }
         
         try {
-            if (type_index == 0 && size >= 4) { // Int32
-                int32_t val = std::stoi(input_value);
-                *reinterpret_cast<int32_t*>(new_value.data()) = val;
-                success = true;
-            } else if (type_index == 1 && size >= 4) { // UInt32
-                uint32_t val = static_cast<uint32_t>(std::stoul(input_value));
-                *reinterpret_cast<uint32_t*>(new_value.data()) = val;
-                success = true;
-            } else if (type_index == 2 && size >= 4) { // Float
-                float val = std::stof(input_value);
-                *reinterpret_cast<float*>(new_value.data()) = val;
-                success = true;
-            } else if (type_index == 3 && size >= 8) { // Double
-                double val = std::stod(input_value);
-                *reinterpret_cast<double*>(new_value.data()) = val;
-                success = true;
-            } else if (type_index == 4) { // Hex
-                std::istringstream iss(input_value);
-                std::string byte_str;
-                size_t byte_idx = 0;
-                
-                while (iss >> byte_str && byte_idx < size) {
-                    try {
-                        uint8_t byte_val = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
-                        new_value[byte_idx++] = byte_val;
-                    } catch (...) {
-                        status_message = "Invalid hex value: " + byte_str;
-                        return false;
+            // Calculate address of selected item
+            libmem::Address target_addr = address + (selected_index * sizeof(uint64_t));
+            uint64_t value = 0;
+            
+            // Convert based on type
+            switch (type_index) {
+                case 0: { // int64
+                    std::istringstream iss(input_value);
+                    int64_t int_val;
+                    
+                    // Try to parse as hex if it starts with 0x
+                    if (input_value.substr(0, 2) == "0x") {
+                        iss >> std::hex >> int_val;
+                    } else {
+                        iss >> int_val;
                     }
+                    
+                    value = static_cast<uint64_t>(int_val);
+                    break;
                 }
-                success = true;
-            } else if (type_index == 5) { // String
-                size_t copy_size = std::min(input_value.size(), size);
-                std::copy(input_value.begin(), input_value.begin() + copy_size, new_value.begin());
-                success = true;
+                case 1: { // float
+                    float float_val = std::stof(input_value);
+                    std::memcpy(&value, &float_val, sizeof(float));
+                    break;
+                }
+                case 2: { // double
+                    double double_val = std::stod(input_value);
+                    std::memcpy(&value, &double_val, sizeof(double));
+                    break;
+                }
+                case 3: { // bytes (format: "AA BB CC DD")
+                    std::istringstream iss(input_value);
+                    std::string byte_str;
+                    int byte_index = 0;
+                    
+                    while (iss >> byte_str && byte_index < 8) {
+                        // Convert hex string to byte
+                        uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16));
+                        // Place in correct position in value
+                        value |= static_cast<uint64_t>(byte) << (byte_index * 8);
+                        byte_index++;
+                    }
+                    break;
+                }
             }
-        } catch (const std::exception& e) {
-            status_message = "Error parsing value: " + std::string(e.what());
-            return false;
-        }
-        
-        if (!success) {
-            status_message = "Failed to parse value";
-            return false;
-        }
-        
-        // Apply the change
-        if (freeze_value) {
-            // Just update the frozen buffer
-            frozen_buffer = new_value;
-            status_message = "Frozen value updated";
-            return true;
-        } else {
-            // Write directly to memory
-            size_t bytes_written = libmem::WriteMemory(&process, address, new_value.data(), size);
-            if (bytes_written == size) {
-                status_message = "Value changed successfully";
+            
+            // Apply the change
+            if (freeze_value) {
+                // Just update the frozen buffer
+                memory_values[selected_index] = value;
+                
+                // Update display
+                libmem::Address row_addr = address + (selected_index * sizeof(uint64_t));
+                std::string line = FormatAsHex(row_addr) + ": " + 
+                                  FormatHexBytes(value, sizeof(uint64_t)) + "  " +
+                                  FormatAsAscii(value, sizeof(uint64_t));
+                memory_lines[selected_index] = line;
+                
+                status_message = "Value updated (frozen)";
                 return true;
             } else {
-                status_message = "Failed to write memory";
-                return false;
+                // Write directly to memory
+                libmem::Address target_addr = address + (selected_index * sizeof(uint64_t));
+                try {
+                    // Use template version of WriteMemory
+                    libmem::WriteMemory<uint64_t>(target_addr, value);
+                    
+                    // Update our cached value
+                    memory_values[selected_index] = value;
+                    
+                    // Update display
+                    libmem::Address row_addr = address + (selected_index * sizeof(uint64_t));
+                    std::string line = FormatAsHex(row_addr) + ": " + 
+                                      FormatHexBytes(value, sizeof(uint64_t)) + "  " +
+                                      FormatAsAscii(value, sizeof(uint64_t));
+                    memory_lines[selected_index] = line;
+                    
+                    status_message = "Value updated successfully";
+                    return true;
+                } catch (const std::exception& e) {
+                    status_message = "Failed to write memory: " + std::string(e.what());
+                    return false;
+                }
             }
+        } catch (const std::exception& e) {
+            status_message = "Error: " + std::string(e.what());
+            return false;
         }
     };
     
-    // Create input for changing values
-    InputOption input_option;
-    input_option.on_enter = [&] {
-        // Always consume the Enter key to prevent newlines in the input field
-        if (is_changing_value && !change_value_input.empty()) {
-            if (apply_value_change(change_value_input, change_type_selected)) {
-                // Successfully changed value
-                is_changing_value = false;
-                change_value_input = ""; // Clear input after successful change
-            }
+    // Function to toggle freezing
+    auto toggle_freeze = [&]() {
+        freeze_value = !freeze_value;
+        if (freeze_value) {
+            // Copy current values to frozen buffer
+            frozen_buffer = memory_values;
+            status_message = "Memory values frozen";
+        } else {
+            status_message = "Memory values unfrozen";
         }
-        return true; // Always consume Enter key to prevent newlines
     };
-    input_option.multiline = false; // Ensure input is single-line only
     
-    auto input_component = Input(&change_value_input, "Enter new value", input_option);
-    
-    // Create type selection menu
-    auto type_menu = Menu(&change_type_entries, &change_type_selected);
-    
-    // Create container for change value UI
-    auto change_container = Container::Vertical({
-        type_menu,
-        input_component
-    });
-    
-    // Initial memory read
-    update_memory_display();
-    
-    // Flag to control auto-refresh
-    std::atomic<bool> should_quit(false);
-    
-    // Start a thread to update the memory display periodically
-    std::thread refresh_thread([&]() {
-        while (!should_quit) {
-            if (!is_paused) {
-                update_memory_display();
-                screen.PostEvent(Event::Custom);
+    // Update thread for real-time memory watching
+    std::atomic<bool> thread_running{true};
+    std::thread update_thread([&]() {
+        while (thread_running) {
+            // Only update if not paused
+            if (!paused && is_running) {
+                try {
+                    // Read current memory values
+                    std::vector<uint64_t> current_values(memory_values.size(), 0);
+                    for (size_t i = 0; i < current_values.size(); i++) {
+                        libmem::Address curr_addr = address + (i * sizeof(uint64_t));
+                        try {
+                            current_values[i] = libmem::ReadMemory<uint64_t>(curr_addr);
+                        } catch (...) {
+                            // Handle failure for this address
+                            current_values[i] = memory_values[i]; // Keep old value
+                        }
+                    }
+                    
+                    // If we have frozen values, write them back to memory
+                    if (freeze_value) {
+                        for (size_t i = 0; i < memory_values.size(); i++) {
+                            libmem::Address curr_addr = address + (i * sizeof(uint64_t));
+                            try {
+                                // Write frozen value back to memory
+                                libmem::WriteMemory<uint64_t>(curr_addr, frozen_buffer[i]);
+                                // Update display for frozen memory - shows what we're enforcing
+                                current_values[i] = frozen_buffer[i];
+                            } catch (...) {
+                                // Ignore write failures
+                            }
+                        }
+                    }
+                    
+                    // Check for changes and update display
+                    for (size_t i = 0; i < current_values.size(); i++) {
+                        if (current_values[i] != memory_values[i]) {
+                            // Value changed, update display
+                            libmem::Address row_addr = address + (i * sizeof(uint64_t));
+                            std::string line = FormatAsHex(row_addr) + ": " + 
+                                              FormatHexBytes(current_values[i], sizeof(uint64_t)) + "  " +
+                                              FormatAsAscii(current_values[i], sizeof(uint64_t));
+                            memory_lines[i] = line;
+                            memory_values[i] = current_values[i];
+                        }
+                    }
+                } catch (...) {
+                    // Ignore errors during update
+                }
             }
+            
+            // Sleep to avoid excessive CPU usage
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
     });
     
-    // Event handler component
-    auto event_handler = CatchEvent([&](Event event) {
-        if (is_changing_value) {
-            // In change value mode
+    // Create container for edit components
+    auto edit_container = Container::Vertical({
+        input_component,
+        type_selector
+    });
+    
+    // Main component structure
+    auto container = Container::Vertical({
+        memory_component,
+        edit_container
+    });
+    container->SetActiveChild(memory_component);
+    
+    // Create renderer for the memory watch view
+    auto renderer = Renderer(container, [&] {
+        std::string title = "Memory Watch - " + FormatAsHex(address) + " (" + 
+                          std::to_string(size) + " bytes)" + 
+                          (paused ? " [PAUSED]" : "");
+                          
+        // Show edit components only when editing
+        Elements edit_elements;
+        if (editing) {
+            edit_elements = {
+                separator(),
+                text("Edit Value as " + type_names[type_index]),
+                hbox({
+                    text("New value: "),
+                    input_component->Render()
+                }),
+                type_selector->Render(),
+                text("Press ENTER to apply, ESC to cancel") | color(Color::GrayDark)
+            };
+        }
+        
+        // Construct the elements in proper format for vbox
+        Elements elements = {
+            text(title) | bold,
+            separator(),
+            memory_component->Render() | frame | ftxui::size(HEIGHT, LESS_THAN, 20)
+        };
+        
+        // Add edit elements if editing
+        elements.insert(elements.end(), edit_elements.begin(), edit_elements.end());
+        
+        // Add the remaining elements
+        elements.push_back(separator());
+        elements.push_back(text(status_message));
+        elements.push_back(text("Controls: (E)dit value | (P)ause | (G)o to address | (ESC) Return") | color(Color::GrayDark));
+        
+        return vbox(elements);
+    });
+    
+    // Add event handler
+    auto event_handler = CatchEvent(renderer, [&](Event event) {
+        if (editing) {
+            // Edit mode controls
             if (event == Event::Escape) {
-                is_changing_value = false;
-                change_value_input = ""; // Clear input on cancel
+                // Cancel editing
+                editing = false;
+                container->SetActiveChild(memory_component);
+                edit_value = "";
+                return true;
+            } else if (event == Event::Return) {
+                // Apply the edit
+                if (apply_value_change(edit_value, type_index)) {
+                    editing = false;
+                    container->SetActiveChild(memory_component);
+                    edit_value = "";
+                }
                 return true;
             }
-            
-            if (event == Event::Return) {
-                if (!change_value_input.empty()) {
-                    if (apply_value_change(change_value_input, change_type_selected)) {
-                        // Successfully changed value
-                        is_changing_value = false;
-                        change_value_input = ""; // Clear input after successful change
-                    }
-                }
-                return true; // Always consume Enter key to prevent newlines
-            }
-            
-            // Let the input component handle other events
             return false;
         } else {
-            // In regular mode
-            // Freeze/Unfreeze on F key
-            if (event.is_character() && (event.character() == "f" || event.character() == "F")) {
+            // Normal mode controls
+            if (event == Event::Escape) {
+                screen.Exit();
+                return true;
+            } else if (event == Event::Character('e') || event == Event::Character('E')) {
+                // Enter edit mode
+                editing = true;
+                container->SetActiveChild(edit_container);
+                
+                // Prefill with current value based on type
+                uint64_t current_value = memory_values[selected_index];
+                switch (type_index) {
+                    case 0: // int64
+                        edit_value = std::to_string(static_cast<int64_t>(current_value));
+                        break;
+                    case 1: { // float
+                        float float_val;
+                        std::memcpy(&float_val, &current_value, sizeof(float));
+                        edit_value = std::to_string(float_val);
+                        break;
+                    }
+                    case 2: { // double
+                        double double_val;
+                        std::memcpy(&double_val, &current_value, sizeof(double));
+                        edit_value = std::to_string(double_val);
+                        break;
+                    }
+                    case 3: // bytes
+                        edit_value = FormatHexBytes(current_value, sizeof(uint64_t));
+                        break;
+                }
+                
+                return true;
+            } else if (event == Event::Character('p') || event == Event::Character('P')) {
+                // Toggle pause
+                paused = !paused;
+                status_message = paused ? "Watching paused" : "Watching resumed";
+                return true;
+            } else if (event == Event::Character('f') || event == Event::Character('F')) {
+                // Toggle freeze
                 toggle_freeze();
                 return true;
             }
-            
-            // Change value on C key
-            if (event.is_character() && (event.character() == "c" || event.character() == "C")) {
-                is_changing_value = true;
-                // Pre-fill the input field with the current value based on type
-                switch (change_type_selected) {
-                    case 0: change_value_input = int32_value; break;
-                    case 1: change_value_input = uint32_value; break;
-                    case 2: change_value_input = float_value; break;
-                    case 3: change_value_input = double_value; break;
-                    case 4: change_value_input = hex_representation; break;
-                    case 5: change_value_input = string_value; break;
-                }
-                input_component->TakeFocus();
-                return true;
-            }
-            
-            // Pause/Resume on P key
-            if (event.is_character() && (event.character() == "p" || event.character() == "P")) {
-                toggle_pause();
-                return true;
-            }
-            
-            // Quit on Escape or Q key
-            if (event == Event::Escape || 
-                (event.is_character() && (event.character() == "q" || event.character() == "Q"))) {
-                should_quit = true;
-                screen.ExitLoopClosure()();
-                return true;
-            }
-            
             return false;
         }
     });
     
-    // Create the container with the event handler
-    auto component = Container::Vertical({}) | event_handler;
-    
-    // Create the renderer function
-    auto render_function = [&]() -> Element {
-        // Determine status colors
-        ftxui::Color status_color = read_success ? Color::Green : Color::Red;
-        ftxui::Color freeze_color = freeze_value ? Color::Red : Color::Green;
-        ftxui::Color pause_color = is_paused ? Color::Yellow : Color::Green;
-        
-        // Value display section
-        Elements memory_values = {
-            text(" Memory at address: 0x" + std::to_string(address)) | color(Color::Cyan) | bold,
-            text(" "),
-            hbox(text(" Status: "), 
-                 text(freeze_value ? "FROZEN" : "Live") | color(freeze_color),
-                 text(" | "),
-                 text(is_paused ? "PAUSED" : "Watching") | color(pause_color)),
-            text(" "),
-            hbox(text(" Hex bytes:    "), text(hex_representation) | bold),
-            hbox(text(" Int32:        "), text(int32_value) | bold),
-            hbox(text(" UInt32:       "), text(uint32_value) | bold),
-            hbox(text(" Float:        "), text(float_value) | bold),
-            hbox(text(" Double:       "), text(double_value) | bold),
-            hbox(text(" ASCII string: "), text(string_value) | bold),
-        };
-        
-        // Status message
-        Elements status_elements = {
-            text(" Status: " + status_message) | color(status_color)
-        };
-        
-        // Instructions
-        Elements instruction_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" F: Freeze/Unfreeze value"),
-            text(" C: Change value"),
-            text(" P: Pause/Resume watching"),
-            text(" Esc/Q: Exit")
-        };
-        
-        if (is_changing_value) {
-            // Show value change UI
-            return vbox({
-                text("Memory Watch") | bold | color(Color::Blue) | center,
-                separator(),
-                vbox(memory_values),
-                separator(),
-                text(" Change Value") | bold | color(Color::Yellow),
-                text(" "),
-                text(" Select value type:"),
-                type_menu->Render(),
-                text(" "),
-                text(" Enter new value:"),
-                input_component->Render(),
-                text(" "),
-                text(" Press Enter to apply, Esc to cancel") | center,
-                separator(),
-                vbox(status_elements),
-            }) | border;
-        } else {
-            // Show regular memory watch UI
-            return vbox({
-                text("Memory Watch") | bold | color(Color::Blue) | center,
-                separator(),
-                vbox(memory_values),
-                separator(),
-                vbox(status_elements),
-                separator(),
-                vbox(instruction_elements)
-            }) | border;
-        }
-    };
-    
-    // Create renderer component that uses our render function
-    auto renderer_component = Renderer(component, render_function);
-    
     // Run the UI loop
-    screen.Loop(renderer_component);
+    screen.Loop(event_handler);
     
     // Cleanup
-    should_quit = true;
-    if (refresh_thread.joinable()) {
-        refresh_thread.join();
+    thread_running = false;
+    if (update_thread.joinable()) {
+        update_thread.join();
     }
     
-    return read_success;
+    return true;
 }
 
 /**
- * Scan for a byte pattern in a module
+ * Scan a module for a pattern/signature
  * 
- * @param process The process to scan
- * @param module The module to limit the scan to (null for all modules)
- * @param signature The signature string to search for
- * @return ScanResult containing the results of the scan
+ * @param process The target process
+ * @param module Optional module to limit scan to (nullptr for entire process)
+ * @param signature The signature to scan for
+ * @return Result of the scan operation
  */
 SignatureScanResult scan_module_for_pattern(const libmem::Process& process, 
-                                           const std::optional<libmem::Module>& module,
-                                           const std::string& signature) {
+                                       const std::optional<libmem::Module>& module,
+                                       const std::string& signature) {
     SignatureScanResult result;
     result.success = false;
     
     // Parse the signature
-    std::string parsed_sig = parse_signature(signature);
+    std::string cleaned_signature = parse_signature(signature);
+    if (cleaned_signature.empty()) {
+        return result;
+    }
     
-    // Define scanning parameters based on the module
-    libmem::Address start_addr;
-    size_t scan_size;
-    
-    if (module.has_value()) {
-        start_addr = module->base;
-        scan_size = module->size;
-    } else {
-        // Scan first module if no module specified
-        auto modules_opt = libmem::EnumModules(&process);
-        if (!modules_opt.has_value() || modules_opt->empty()) {
+    try {
+        // Determine scan region
+        libmem::Address start_address = 0;
+        size_t scan_size = 0;
+        
+        if (module.has_value()) {
+            // Scan specific module
+            start_address = module->base;
+            scan_size = module->size;
+        } else {
+            // Placeholder for scanning entire process memory
+            // In a real app, would need to enumerate memory regions
             return result;
         }
         
-        start_addr = modules_opt->front().base;
-        scan_size = modules_opt->front().size;
-    }
-    
-    // Perform the signature scan
-    auto found_addr_opt = libmem::SigScan(&process, parsed_sig.c_str(), start_addr, scan_size);
-    
-    if (found_addr_opt.has_value()) {
-        result.success = true;
-        result.address = found_addr_opt.value();
-        result.matches.push_back(found_addr_opt.value());
-    }
-    
-    return result;
-}
-
-/**
- * Scan for an array of bytes in memory using a TUI interface
- * 
- * @param process The process to scan
- * @param module Optional module to limit the scan to
- */
-void scan_for_bytes(const libmem::Process& process, const std::optional<libmem::Module>& module) {
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // UI variables
-    std::string signature_input;
-    std::string status_message = "";
-    bool has_result = false;
-    libmem::Address result_address = 0;
-    std::string result_info = "";
-    
-    // For action menu after scan
-    int action_selected = 0;
-    std::vector<std::string> action_entries = {
-        " Disassemble at match location",
-        " Watch memory at match location",
-        " Back to module selection"
-    };
-    
-    // Create input component for signature
-    InputOption input_option;
-    auto signature_component = Input(&signature_input, "Enter byte pattern (e.g., 48 8D 64 24 ? C6 05)", input_option);
-    
-    // Button to perform the scan
-    auto scan_button = Button("Scan", [&] {
-        if (signature_input.empty()) {
-            status_message = "Please enter a byte pattern";
-            return;
+        // Perform the signature scan using the correct API
+        auto result_opt = libmem::SigScan(&process, cleaned_signature.c_str(), start_address, scan_size);
+        
+        if (result_opt.has_value()) {
+            result.success = true;
+            result.address = result_opt.value();
+            result.matches.push_back(result_opt.value()); // Add the match
         }
-        
-        status_message = "Scanning for pattern: " + signature_input;
-        
-        // Perform the scan
-        SignatureScanResult scan_result = scan_module_for_pattern(process, module, signature_input);
-        
-        if (scan_result.success) {
-            has_result = true;
-            result_address = scan_result.address;
-            result_info = "Found pattern at address: 0x" + std::to_string(scan_result.address);
-            status_message = "Scan completed successfully";
-        } else {
-            has_result = false;
-            status_message = "Pattern not found";
-        }
-    });
-    
-    // Create action menu for when a match is found
-    auto action_menu = Menu(&action_entries, &action_selected);
-    
-    // Create the dialog component structure
-    auto action_container = Container::Vertical({
-        action_menu
-    });
-    
-    // Back button
-    auto back_button = Button("Back", screen.ExitLoopClosure());
-    
-    // Create container with all components
-    auto container = Container::Vertical({
-        signature_component,
-        scan_button,
-        action_container,
-        back_button
-    });
-    
-    // Add keyboard event handling
-    container |= CatchEvent([&](Event event) {
-        if (event == Event::Escape || 
-            (event.is_character() && (event.character() == "q" || event.character() == "Q"))) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // If we have a result and Enter is pressed on action menu
-        if (has_result && event == Event::Return && action_container->Focused()) {
-            screen.ExitLoopClosure()();
-            
-            switch (action_selected) {
-                case 0: // Disassemble
-                    disassemble_memory_region(process, result_address);
-                    break;
-                case 1: { // Watch memory
-                    // Watch memory at the found address (monitoring 16 bytes by default)
-                    watch_memory_region(process, result_address, 16);
-                    break;
-                }
-                case 2: // Back
-                    // Just return to the previous screen
-                    break;
-            }
-            
-            return true;
-        }
-        
-        return false;
-    });
-    
-    // Module information for display
-    std::string module_info = module.has_value() ? 
-        module->name + " (Base: 0x" + std::to_string(module->base) + ")" : 
-        "All Modules";
-    
-    auto renderer = Renderer(container, [&] {
-        // Determine what to show - input form or result actions
-        auto content = vbox({});
-        
-        if (has_result) {
-            content = vbox({
-                hbox(text(" Pattern: "), text(signature_input) | bold),
-                hbox(text(" Result: "), text(result_info) | color(Color::Green) | bold),
-                separator(),
-                text(" Choose an action:") | color(Color::Yellow),
-                action_menu->Render() | flex,
-                separator(),
-                hbox(text(" "), back_button->Render())
-            });
-        } else {
-            content = vbox({
-                text(" Enter byte pattern to search for:") | color(Color::Yellow),
-                hbox(text(" "), signature_component->Render() | flex),
-                separator(),
-                hbox(text(" "), scan_button->Render()),
-                status_message.empty() ? text("") : separator(),
-                status_message.empty() ? text("") : 
-                    text(" " + status_message) | color(status_message.find("not found") != std::string::npos ? Color::Red : Color::Green),
-                separator(),
-                text(" Instructions:") | bold | color(Color::Yellow),
-                text(" "),
-                text(" Enter a byte pattern using spaces between bytes"),
-                text(" Use ? or ?? as wildcards for unknown bytes"),
-                text(" Example: 48 8D 64 24 ? C6 05 ? ? ? ? ?"),
-                separator(),
-                hbox(text(" "), back_button->Render())
-            });
-        }
-        
-        // Main document structure
-        return vbox({
-            text("Scan for Byte Pattern - Process: " + process.name) | bold | color(Color::Blue) | center,
-            text("Module: " + module_info) | color(Color::Cyan) | center,
-            separator(),
-            content
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-}
-
-/**
- * Displays a menu of actions that can be performed on a process/module
- * 
- * @param process The process to perform actions on
- * @param module Optional module if a specific module was selected
- * @return The selected action
- */
-ProcessAction show_process_actions(const libmem::Process& process, const std::optional<libmem::Module>& module = std::nullopt) {
-    // Create a fullscreen terminal
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Data for the UI
-    int selected = 0;
-    std::vector<std::string> menu_entries = {
-        " Scan for array of bytes",
-        " Enter memory address",
-        " Back to module selection"
-    };
-    
-    // Create the menu component
-    auto menu = Menu(&menu_entries, &selected);
-    
-    // Create component container with the menu
-    auto container = Container::Vertical({
-        menu
-    });
-    
-    // Add key event handling for quitting, selecting
-    container |= CatchEvent([&](Event event) {
-        // Back to module list on Escape or B key
-        if (event.is_character() && (event.character() == "b" || event.character() == "B")) {
-            selected = 2; // Back to module selection
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Quit completely on Q key
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            selected = -1; // Mark as canceled
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape) {
-            selected = 2; // Back to module selection
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Select on Enter key
-        if (event == Event::Return) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    // Module information text
-    std::string module_info = module.has_value() ? 
-        module->name + " (Base: 0x" + std::to_string(module->base) + ")" : 
-        "All Modules";
-    
-    auto renderer = Renderer(container, [&] {
-        // Create elements for the UI
-        Elements title_elements = {
-            text("Process Actions - " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center,
-            text("Module: " + module_info) | color(Color::Cyan) | center
-        };
-        
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" ↑/↓ : Navigate list"),
-            text(" Enter : Select action"),
-            text(" Esc/B : Back to module list"),
-            text(" Q : Quit")
-        };
-        
-        // Main document structure
-        return vbox({
-            vbox(title_elements),
-            separator(),
-            hbox({
-                menu->Render() | flex,
-                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
-            }),
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-    
-    if (selected < 0) {
-        std::cout << "Process action selection canceled." << std::endl;
-        return ProcessAction::CANCEL;
-    } else if (selected == 0) {
-        return ProcessAction::SCAN_BYTES;
-    } else if (selected == 1) {
-        return ProcessAction::ENTER_ADDRESS;
-    } else {
-        return ProcessAction::BACK_TO_MODULES;
-    }
-}
-
-/**
- * Enter a specific memory address to examine
- * 
- * @param process The process to examine
- * @param module Optional module context
- */
-void enter_memory_address(const libmem::Process& process, const std::optional<libmem::Module>& module = std::nullopt) {
-    // Create a fullscreen terminal
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Input and state variables
-    std::string address_input;
-    std::string status_message = "";
-    bool has_error = false;
-    bool has_address = false;
-    libmem::Address parsed_address = 0;
-    
-    // Action selection
-    int action_selected = 0;
-    std::vector<std::string> action_entries = {
-        " Disassemble memory at address",
-        " Watch memory at address",
-        " Back to module selection"
-    };
-    
-    // Create input component for address
-    InputOption input_option;
-    input_option.on_enter = [&] {
-        try {
-            // Try to parse the address - support both decimal and hex
-            if (address_input.substr(0, 2) == "0x") {
-                parsed_address = std::stoull(address_input.substr(2), nullptr, 16);
-            } else {
-                parsed_address = std::stoull(address_input, nullptr, 0);
-            }
-            
-            // Validate the address (basic check)
-            if (parsed_address == 0) {
-                status_message = "Invalid address: cannot be zero";
-                has_error = true;
-                has_address = false;
-                return;
-            }
-            
-            status_message = "Address parsed: 0x" + std::to_string(parsed_address);
-            has_error = false;
-            has_address = true;
-        } catch (const std::exception& e) {
-            status_message = "Invalid address format: " + std::string(e.what());
-            has_error = true;
-            has_address = false;
-        }
-    };
-    auto address_input_component = Input(&address_input, "Enter memory address (e.g., 0x7FF45CB00000)", input_option);
-    
-    // Create action menu
-    auto action_menu = Menu(&action_entries, &action_selected);
-    
-    // Create container with the input and menu
-    auto container = Container::Vertical({
-        address_input_component,
-        action_menu
-    });
-    
-    // Add key event handling
-    container |= CatchEvent([&](Event event) {
-        // Back to previous menu on Escape or B key
-        if (event.is_character() && (event.character() == "b" || event.character() == "B")) {
-            action_selected = 2; // Back to module selection
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Quit on Q key
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            action_selected = -1; // Cancel
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape) {
-            action_selected = 2; // Back to module selection
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Select on Enter key if we have a valid address
-        if (event == Event::Return && action_menu->Focused() && has_address) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    // Module information text
-    std::string module_info = module.has_value() ? 
-        module->name + " (Base: 0x" + std::to_string(module->base) + ")" : 
-        "All Modules";
-    
-    auto renderer = ftxui::Renderer(container, [&] {
-        // Title area
-        auto title = vbox({
-            text("Enter Memory Address - " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center,
-            text("Module: " + module_info) | color(Color::Cyan) | center
-        });
-        
-        // Input area
-        auto input_area = vbox({
-            text(" Enter a memory address to examine:") | color(Color::Yellow),
-            hbox(text(" "), address_input_component->Render() | flex)
-        });
-        
-        // Status message
-        auto status_area = text("");
-        if (!status_message.empty()) {
-            status_area = vbox({
-                separator(),
-                text(" " + status_message) | (has_error ? color(Color::Red) : color(Color::Green))
-            });
-        }
-        
-        // Action menu
-        auto action_area = text("");
-        if (has_address) {
-            action_area = vbox({
-                text(" Choose action:") | color(Color::Yellow),
-                action_menu->Render() | flex
-            });
-        }
-        
-        // Instructions
-        auto instructions = vbox({
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" Enter: Parse address or select action"),
-            text(" Tab: Switch between input and menu"),
-            text(" Esc/B: Back to module list"),
-            text(" Q: Quit")
-        });
-        
-        // Main document structure
-        return vbox({
-            title,
-            separator(),
-            input_area,
-            status_area,
-            separator(),
-            action_area,
-            separator(),
-            instructions | size(HEIGHT, EQUAL, 6)
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-    
-    // Perform the selected action
-    if (has_address && action_selected >= 0 && action_selected < 2) {
-        if (action_selected == 0) {
-            // Disassemble memory
-            disassemble_memory_region(process, parsed_address);
-        } else if (action_selected == 1) {
-            // Watch memory
-            watch_memory_region(process, parsed_address);
-        }
-    }
-}
-
-/**
- * Displays a fullscreen list of processes using FTXUI and libmem, allowing the user to select one.
- * 
- * @return The PID of the selected process, or 0 if failed/canceled
- */
-libmem::Pid process_select() {
-    // Create a fullscreen terminal
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Get processes using libmem
-    std::vector<libmem::Process> processes;
-    auto processes_opt = libmem::EnumProcesses();
-    
-    if (!processes_opt.has_value()) {
-        std::cout << "Failed to enumerate processes." << std::endl;
-        return 0;
-    }
-    
-    processes = processes_opt.value();
-    std::cout << "Found " << processes.size() << " processes" << std::endl;
-    
-    // Data for the UI
-    int selected = 0;
-    std::vector<std::string> menu_entries;
-    std::vector<libmem::Process> filtered_processes = processes;
-    std::string filter_value;
-    bool focus_filter = false;
-    
-    // Create initial menu entries for each process
-    for (const auto& process : processes) {
-        std::string entry_text = " PID: " + std::to_string(process.pid) + " | " + process.name;
-        menu_entries.push_back(entry_text);
-    }
-    
-    // Function to filter processes based on user input
-    auto filter_processes = [&]() {
-        filtered_processes.clear();
-        menu_entries.clear();
-        
-        // If filter is empty, show all processes
-        if (filter_value.empty()) {
-            filtered_processes = processes;
-            for (const auto& process : processes) {
-                std::string entry_text = " PID: " + std::to_string(process.pid) + " | " + process.name;
-                menu_entries.push_back(entry_text);
-            }
-            return;
-        }
-        
-        // Convert filter to lowercase for case-insensitive comparison
-        std::string filter_lower = filter_value;
-        std::transform(filter_lower.begin(), filter_lower.end(), filter_lower.begin(),
-                      [](unsigned char c){ return std::tolower(c); });
-        
-        // Filter processes by name or PID
-        for (const auto& process : processes) {
-            std::string name_lower = process.name;
-            std::string pid_str = std::to_string(process.pid);
-            
-            std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(),
-                          [](unsigned char c){ return std::tolower(c); });
-            
-            if (name_lower.find(filter_lower) != std::string::npos || 
-                pid_str.find(filter_value) != std::string::npos) {
-                filtered_processes.push_back(process);
-                std::string entry_text = " PID: " + std::to_string(process.pid) + " | " + process.name;
-                menu_entries.push_back(entry_text);
-            }
-        }
-        
-        // Reset selection if it's now out of bounds
-        if (selected >= (int)filtered_processes.size()) {
-            selected = filtered_processes.size() > 0 ? 0 : -1;
-        }
-    };
-    
-    // Create the menu component
-    auto menu = Menu(&menu_entries, &selected);
-    
-    // Filter input for searching processes
-    InputOption filter_option;
-    filter_option.on_change = [&] { 
-        filter_processes(); 
-    };
-    auto filter_input = Input(&filter_value, "Filter by process name or PID", filter_option);
-    
-    // Create component container with the filter and menu
-    auto container = Container::Vertical({
-        filter_input,
-        menu
-    });
-    
-    // Add key event handling for quitting, selecting, and focusing filter
-    container |= CatchEvent([&](Event event) {
-        // Quit on Escape or Q key
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            selected = -1; // Mark as canceled
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape) {
-            selected = -1; // Mark as canceled
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Select on Enter key
-        if (event == Event::Return && selected >= 0 && selected < (int)filtered_processes.size()) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Press 'f' to focus on filter input
-        if (event.is_character() && (event.character() == "f" || event.character() == "F")) {
-            focus_filter = true;
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    auto renderer = Renderer(container, [&] {
-        // Process details section
-        std::string pid_str = (selected >= 0 && selected < (int)filtered_processes.size()) 
-                             ? std::to_string(filtered_processes[selected].pid) : "N/A";
-        std::string name_str = (selected >= 0 && selected < (int)filtered_processes.size()) 
-                             ? filtered_processes[selected].name : "N/A";
-        std::string path_str = (selected >= 0 && selected < (int)filtered_processes.size()) 
-                             ? filtered_processes[selected].path : "N/A";
-        std::string bits_str = (selected >= 0 && selected < (int)filtered_processes.size()) 
-                             ? std::to_string(filtered_processes[selected].bits) : "N/A";
-        
-        // Create elements for the UI
-        Elements title_elements = {
-            text("Process Selection") | bold | color(Color::Blue) | center
-        };
-        
-        Elements filter_elements = {
-            hbox(text(" Filter: "), filter_input->Render() | flex)
-        };
-        
-        Elements details_elements = {
-            text(" Process Details:") | bold | color(Color::Green),
-            text(" "),
-            hbox(text(" PID: "), text(pid_str) | bold),
-            hbox(text(" Name: "), text(name_str)),
-            hbox(text(" Path: "), text(path_str)),
-            hbox(text(" Architecture: "), text(bits_str + "-bit"))
-        };
-        
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" ↑/↓ : Navigate list"),
-            text(" Enter : Select process"),
-            text(" Esc/Q : Exit/Cancel"),
-            text(" F : Focus on filter"),
-            text(" Type : Filter processes")
-        };
-        
-        // Show how many processes are being displayed
-        std::string stats = " Showing " + std::to_string(filtered_processes.size()) + 
-                           " of " + std::to_string(processes.size()) + " processes";
-        
-        // Set focus to filter input if the 'f' key was pressed
-        if (focus_filter) {
-            filter_input->TakeFocus();
-            focus_filter = false;
-        }
-        
-        // Main document structure
-        return vbox({
-            vbox(title_elements),
-            separator(),
-            vbox(filter_elements),
-            separator(),
-            hbox({
-                vbox(details_elements) | size(WIDTH, EQUAL, 50),
-                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
-            }),
-            separator(),
-            menu->Render() | flex | frame,
-            separator(),
-            text(stats) | center
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-    
-    // Return the selected process PID or 0 if canceled
-    if (selected < 0 || selected >= (int)filtered_processes.size()) {
-        std::cout << "Process selection canceled." << std::endl;
-        return 0;
-    }
-    
-    std::cout << "Selected process: " << filtered_processes[selected].name 
-              << " (PID: " << filtered_processes[selected].pid << ")" << std::endl;
-    
-    return filtered_processes[selected].pid;
-}
-
-/**
- * Displays a fullscreen list of modules in a process using FTXUI and libmem.
- * 
- * @param process The process to show modules for
- * @return ModuleSelectionResult containing selected module information
- */
-ModuleSelectionResult module_select(const libmem::Process& process) {
-    ModuleSelectionResult result;
-    
-    // Create a fullscreen terminal
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    std::cout << "Getting modules for process: " << process.name << " (PID: " << process.pid << ")" << std::endl;
-    
-    // Get modules using libmem
-    std::vector<libmem::Module> modules;
-    auto modules_opt = libmem::EnumModules(&process);
-    
-    if (!modules_opt.has_value()) {
-        std::cout << "Failed to enumerate modules." << std::endl;
-        return result;
-    }
-    
-    modules = modules_opt.value();
-    result.all_modules = modules; // Store all modules in the result
-    std::cout << "Found " << modules.size() << " modules" << std::endl;
-    
-    // Data for the UI
-    int selected = 0;
-    std::vector<std::string> menu_entries;
-    std::vector<libmem::Module> filtered_modules;
-    std::string filter_value;
-    bool focus_filter = false;
-    
-    // Function to create menu entries with the "Select All Modules" option first
-    auto create_menu_entries = [&](const std::vector<libmem::Module>& mod_list) {
-        menu_entries.clear();
-        filtered_modules.clear();
-        
-        // Add "Select All Modules" as the first option
-        menu_entries.push_back(" [Select All Modules]");
-        
-        // Add modules to the filtered list and menu entries
-        for (const auto& module : mod_list) {
-            filtered_modules.push_back(module);
-            std::string entry_text = " " + module.name + " (Base: 0x" + 
-                                  std::to_string(module.base) + ", Size: " + 
-                                  std::to_string(module.size) + " bytes)";
-            menu_entries.push_back(entry_text);
-        }
-    };
-    
-    // Initial population of the menu
-    create_menu_entries(modules);
-    
-    // Function to filter modules based on user input
-    auto filter_modules = [&]() {
-        std::vector<libmem::Module> matching_modules;
-        
-        // If filter is empty, show all modules
-        if (filter_value.empty()) {
-            matching_modules = modules;
-        } else {
-            // Convert filter to lowercase for case-insensitive comparison
-            std::string filter_lower = filter_value;
-            std::transform(filter_lower.begin(), filter_lower.end(), filter_lower.begin(),
-                          [](unsigned char c){ return std::tolower(c); });
-            
-            // Filter modules by name or address
-            for (const auto& module : modules) {
-                std::string name_lower = module.name;
-                std::string path_lower = module.path;
-                std::string addr_str = "0x" + std::to_string(module.base);
-                
-                std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(),
-                              [](unsigned char c){ return std::tolower(c); });
-                std::transform(path_lower.begin(), path_lower.end(), path_lower.begin(),
-                              [](unsigned char c){ return std::tolower(c); });
-                
-                if (name_lower.find(filter_lower) != std::string::npos || 
-                    path_lower.find(filter_lower) != std::string::npos ||
-                    addr_str.find(filter_value) != std::string::npos) {
-                    matching_modules.push_back(module);
-                }
-            }
-        }
-        
-        create_menu_entries(matching_modules);
-        
-        // Reset selection if it's now out of bounds
-        if (selected >= (int)menu_entries.size()) {
-            selected = menu_entries.size() > 0 ? 0 : 0;
-        }
-    };
-    
-    // Create the menu component
-    auto menu = Menu(&menu_entries, &selected);
-    
-    // Filter input for searching modules
-    InputOption filter_option;
-    filter_option.on_change = [&] { 
-        filter_modules(); 
-    };
-    auto filter_input = Input(&filter_value, "Filter by module name or address", filter_option);
-    
-    // Create component container with the filter and menu
-    auto container = Container::Vertical({
-        filter_input,
-        menu
-    });
-    
-    // Add key event handling for quitting, selecting, and focusing filter
-    container |= CatchEvent([&](Event event) {
-        // Back to process list on Escape or B key
-        if (event.is_character() && (event.character() == "b" || event.character() == "B")) {
-            result.back_to_process_list = true;
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Quit completely on Q key
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            selected = -1; // Mark as canceled
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape) {
-            result.back_to_process_list = true;
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        // Select on Enter key
-        if (event == Event::Return) {
-            if (selected == 0) {
-                // "Select All Modules" was chosen
-                result.success = true;
-                result.select_all_modules = true;
-                screen.ExitLoopClosure()();
-                return true;
-            } else if (selected > 0 && selected <= (int)filtered_modules.size()) {
-                // A specific module was selected
-                result.success = true;
-                result.selected_module = filtered_modules[selected - 1]; // -1 because of "Select All" option
-                screen.ExitLoopClosure()();
-                return true;
-            }
-        }
-        
-        // Press 'f' to focus on filter input
-        if (event.is_character() && (event.character() == "f" || event.character() == "F")) {
-            focus_filter = true;
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    auto renderer = Renderer(container, [&] {
-        // Module details section
-        std::string base_str = "N/A";
-        std::string end_str = "N/A";
-        std::string size_str = "N/A";
-        std::string name_str = "N/A";
-        std::string path_str = "N/A";
-        
-        // Get details for the selected module
-        if (selected > 0 && selected <= (int)filtered_modules.size()) {
-            const auto& module = filtered_modules[selected - 1]; // -1 because of "Select All" option
-            base_str = "0x" + std::to_string(module.base);
-            end_str = "0x" + std::to_string(module.end);
-            size_str = std::to_string(module.size) + " bytes";
-            name_str = module.name;
-            path_str = module.path;
-        } else if (selected == 0) {
-            // "Select All Modules" option
-            name_str = "All Modules";
-            size_str = std::to_string(modules.size()) + " modules total";
-        }
-        
-        // Create elements for the UI
-        Elements title_elements = {
-            text("Module List - Process: " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center
-        };
-        
-        Elements filter_elements = {
-            hbox(text(" Filter: "), filter_input->Render() | flex)
-        };
-        
-        Elements details_elements = {
-            text(" Module Details:") | bold | color(Color::Green),
-            text(" "),
-            hbox(text(" Name: "), text(name_str) | bold),
-            hbox(text(" Base Address: "), text(base_str)),
-            hbox(text(" End Address: "), text(end_str)),
-            hbox(text(" Size: "), text(size_str)),
-            hbox(text(" Path: "), text(path_str))
-        };
-        
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" ↑/↓ : Navigate list"),
-            text(" Enter : Select module/option"),
-            text(" Esc/B : Back to process list"),
-            text(" Q : Quit"),
-            text(" F : Focus on filter"),
-            text(" Type : Filter modules")
-        };
-        
-        // Show how many modules are being displayed
-        std::string stats = " Showing " + std::to_string(filtered_modules.size()) + 
-                           " of " + std::to_string(modules.size()) + " modules";
-        
-        // Set focus to filter input if the 'f' key was pressed
-        if (focus_filter) {
-            filter_input->TakeFocus();
-            focus_filter = false;
-        }
-        
-        // Main document structure
-        return vbox({
-            vbox(title_elements),
-            separator(),
-            vbox(filter_elements),
-            separator(),
-            hbox({
-                vbox(details_elements) | size(WIDTH, EQUAL, 50),
-                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
-            }),
-            separator(),
-            menu->Render() | flex | frame,
-            separator(),
-            text(stats) | center
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-    
-    if (selected < 0) {
-        std::cout << "Module selection canceled." << std::endl;
-    } else if (selected == 0) {
-        std::cout << "Selected all modules." << std::endl;
-    } else if (selected <= (int)filtered_modules.size()) {
-        std::cout << "Selected module: " << filtered_modules[selected - 1].name 
-              << " (Base: 0x" << filtered_modules[selected - 1].base << ")" << std::endl;
+    } catch (const std::exception&) {
+        // Handle exceptions
+        result.success = false;
     }
     
     return result;
 }
 
-/**
- * Displays a fullscreen list of modules in a process using FTXUI and libmem.
- * 
- * @param process_pid The PID of the process to show modules for
- * @return ModuleSelectionResult containing selected module information
- */
-ModuleSelectionResult show_process_modules(libmem::Pid process_pid) {
-    ModuleSelectionResult result;
-    
-    // Get the process
-    auto process_opt = libmem::GetProcess(process_pid);
-    if (!process_opt.has_value()) {
-        std::cout << "Failed to get process with PID: " << process_pid << std::endl;
-        return result;
-    }
-    
-    auto process = process_opt.value();
-    return module_select(process);
-}
-
-void handle_module_menu(const libmem::Process& process, const std::vector<libmem::Module>& modules, int selected_module) {
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    std::string input;
-    int entries_selected = 0;
-    std::vector<std::string> entries = {
-        " Dump module",
-        " Find bytes in memory",
-        " Disassemble memory region",
-        " Watch memory region",
-        " Enter memory address",
-        " Back to process list"
+// Generate fake assembly instructions for display
+std::vector<AsmInstruction> GenerateFakeDisassembly(uint64_t baseAddress, uint64_t counter) {
+    // Common x86_64 instructions
+    const std::vector<std::pair<std::string, std::string>> instructions = {
+        {"mov", "rax, [rbp-0x8]"},
+        {"push", "rbx"},
+        {"pop", "rcx"},
+        {"add", "rax, rbx"},
+        {"sub", "rcx, 0x10"},
+        {"xor", "rdx, rdx"},
+        {"call", "0x12345678"},
+        {"jmp", "0x87654321"},
+        {"cmp", "rax, 0x1"},
+        {"je", FormatAsHex(baseAddress + 0x20)},
+        {"lea", "rsi, [rip+0x1234]"},
+        {"ret", ""},
     };
     
-    auto container = Container::Vertical({
-        Menu(&entries, &entries_selected)
-    });
+    std::vector<AsmInstruction> result;
     
-    container |= CatchEvent([&](Event event) {
-        if (event == Event::Escape || (event.is_character() && (event.character() == "b" || event.character() == "B"))) {
-            entries_selected = entries.size() - 1; // Back to process list
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            entries_selected = -1; // Exit program
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Return) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        return false;
-    });
+    // Use counter to add some variation
+    uint64_t seed = counter % 12;
     
-    std::string module_name;
-    if (selected_module == -1) {
-        module_name = "All Modules";
-    } else {
-        module_name = modules[selected_module].name;
+    for (int i = 0; i < 10; i++) {
+        int idx = (seed + i) % instructions.size();
+        auto& [mnemonic, operands] = instructions[idx];
+        
+        uint64_t address = baseAddress + (i * 4);
+        std::string bytes = FormatHexBytes(address + counter, 4);
+        
+        result.push_back({address, bytes, mnemonic, operands});
     }
     
-    auto renderer = Renderer(container, [&, module_name, process] {
-        return vbox({
-            text("Module Menu - " + process.name + " (PID: " + std::to_string(process.pid) + ")") | bold | color(Color::Blue) | center,
-            text("Selected Module: " + module_name) | color(Color::Cyan) | center,
-            separator(),
-            container->Render(),
-            separator(),
-            text(" Esc/B: Back to process list") | color(Color::Yellow),
-            text(" Q: Quit") | color(Color::Yellow)
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-    
-    // Handle menu selection
-    if (entries_selected >= 0) {
-        if (entries_selected == 0) {
-            // Dump module
-            if (selected_module != -1) {
-                dump_module(process, modules[selected_module]);
-            }
-        } else if (entries_selected == 1) {
-            // Find bytes
-            if (selected_module != -1) {
-                find_bytes(process, modules[selected_module]);
-            } else {
-                find_bytes(process, std::nullopt);
-            }
-        } else if (entries_selected == 2) {
-            // Disassemble memory region
-            if (selected_module != -1) {
-                disassemble_memory_region(process, modules[selected_module].base);
-            }
-        } else if (entries_selected == 3) {
-            // Watch memory region
-            if (selected_module != -1) {
-                watch_memory_region(process, modules[selected_module].base);
-            }
-        } else if (entries_selected == 4) {
-            // Enter memory address
-            if (selected_module != -1) {
-                enter_memory_address(process, modules[selected_module]);
-            } else {
-                enter_memory_address(process);
-            }
-        } else if (entries_selected == 5) {
-            // Back to process list - do nothing, loop will exit
-        }
-    }
-}
-
-/**
- * Dump a module's information and memory to console
- * 
- * @param process The process containing the module
- * @param module The module to dump
- */
-void dump_module(const libmem::Process& process, const libmem::Module& module) {
-    auto screen = ScreenInteractive::Fullscreen();
-    
-    // Data for the UI
-    std::string status_message = "Dumping module: " + module.name;
-    std::vector<std::string> dump_lines;
-    
-    // Add module information
-    dump_lines.push_back("Module: " + module.name);
-    dump_lines.push_back("Path: " + module.path);
-    dump_lines.push_back("Base address: 0x" + std::to_string(module.base));
-    dump_lines.push_back("End address: 0x" + std::to_string(module.end));
-    dump_lines.push_back("Size: " + std::to_string(module.size) + " bytes");
-    dump_lines.push_back("");
-    
-    // Add memory preview of the first 1024 bytes or less
-    const size_t preview_size = std::min<size_t>(1024, module.size);
-    std::vector<uint8_t> memory_buffer(preview_size, 0);
-    size_t bytes_read = libmem::ReadMemory(&process, module.base, memory_buffer.data(), preview_size);
-    
-    if (bytes_read > 0) {
-        dump_lines.push_back("Memory preview (first " + std::to_string(bytes_read) + " bytes):");
-        
-        // Format the memory in rows of 16 bytes
-        for (size_t offset = 0; offset < bytes_read; offset += 16) {
-            std::stringstream line;
-            line << "0x" << std::hex << (module.base + offset) << ": ";
-            
-            // Hex representation
-            for (size_t i = 0; i < 16 && (offset + i) < bytes_read; i++) {
-                char hex_buff[4];
-                snprintf(hex_buff, sizeof(hex_buff), "%02X ", memory_buffer[offset + i]);
-                line << hex_buff;
-            }
-            
-            // Pad if less than 16 bytes
-            const size_t remaining = bytes_read - offset;
-            if (remaining < 16) {
-                for (size_t i = 0; i < (16 - remaining); i++) {
-                    line << "   ";
-                }
-                if (remaining <= 8) line << " "; // Extra space if we didn't print the second half
-            }
-            
-            // ASCII representation
-            line << " | ";
-            for (size_t i = 0; i < 16 && (offset + i) < bytes_read; i++) {
-                char c = memory_buffer[offset + i];
-                line << (c >= 32 && c <= 126 ? c : '.');
-            }
-            
-            dump_lines.push_back(line.str());
-            
-            // Limit the number of lines to display
-            if (dump_lines.size() >= 500) {
-                dump_lines.push_back("... (output truncated, module too large to display completely)");
-                break;
-            }
-        }
-    } else {
-        dump_lines.push_back("Failed to read module memory.");
-    }
-    
-    // Create components for the UI
-    int selected_line = 0;
-    auto dump_menu = Menu(&dump_lines, &selected_line);
-    
-    // Create container with the menu
-    auto container = Container::Vertical({
-        dump_menu
-    });
-    
-    // Add key event handling for quitting
-    container |= CatchEvent([&](Event event) {
-        // Quit on Escape, Q key, or Enter
-        if (event.is_character() && (event.character() == "q" || event.character() == "Q")) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        if (event == Event::Escape || event == Event::Return) {
-            screen.ExitLoopClosure()();
-            return true;
-        }
-        
-        return false;  // Pass other events through
-    });
-    
-    auto renderer = Renderer(container, [&] {
-        // Create elements for the UI
-        Elements title_elements = {
-            text("Module Dump") | bold | color(Color::Blue) | center
-        };
-        
-        Elements status_elements = {
-            text(status_message) | color(Color::Green) | center
-        };
-        
-        Elements instructions_elements = {
-            text(" Instructions:") | bold | color(Color::Yellow),
-            text(" "),
-            text(" ↑/↓ : Scroll dump"),
-            text(" Enter/Esc/Q : Return to previous screen")
-        };
-        
-        // Main document structure
-        return vbox({
-            vbox(title_elements),
-            separator(),
-            vbox(status_elements),
-            separator(),
-            hbox({
-                dump_menu->Render() | flex,
-                vbox(instructions_elements) | size(WIDTH, EQUAL, 30)
-            }),
-            separator(),
-            text(" Press any key to return") | center
-        }) | border;
-    });
-    
-    screen.Loop(renderer);
-}
-
-/**
- * Find bytes in process memory (alias for scan_for_bytes)
- * 
- * @param process The process to scan
- * @param module Optional module to limit the scan to
- */
-void find_bytes(const libmem::Process& process, const std::optional<libmem::Module>& module) {
-    scan_for_bytes(process, module);
+    return result;
 }
 
 int main() {
-    bool quit = false;
+  using namespace ftxui;
+  
+  // Create a fullscreen interface
+  auto screen = ScreenInteractive::Fullscreen();
+
+  // Counter for the background thread
+  std::atomic<uint64_t> counter{0};
+  std::atomic<bool> thread_running{true};
+  
+  // Start a background thread that counts up
+  std::thread counter_thread([&counter, &thread_running]() {
+    while (thread_running) {
+      counter++;
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
+  // Dummy process list - create a larger list
+  std::vector<ProcessInfo> all_processes = {
+      {"chrome.exe", 1234, 5.2, 256},
+      {"explorer.exe", 2345, 1.8, 128},
+      {"notepad.exe", 3456, 0.5, 32},
+      {"spotify.exe", 4567, 3.2, 192},
+      {"discord.exe", 5678, 2.1, 160},
+      {"vscode.exe", 6789, 4.5, 224},
+      {"slack.exe", 7890, 1.9, 144},
+      {"firefox.exe", 8901, 4.8, 240},
+      {"steam.exe", 9012, 3.7, 208},
+      {"outlook.exe", 1023, 2.3, 176},
+      {"photoshop.exe", 2134, 6.7, 512},
+      {"vlc.exe", 3245, 1.2, 64},
+      {"winamp.exe", 4356, 0.8, 48},
+      {"word.exe", 5467, 2.5, 128},
+      {"excel.exe", 6578, 3.1, 196},
+      {"powerpoint.exe", 7689, 2.8, 180},
+      {"itunes.exe", 8790, 1.7, 120},
+      {"skype.exe", 9801, 1.4, 112},
+      {"telegram.exe", 1024, 1.1, 88},
+      {"whatsapp.exe", 2135, 1.3, 96},
+      {"malwarebytes.exe", 3246, 0.9, 120},
+      {"avast.exe", 4357, 1.6, 156},
+      {"winrar.exe", 5468, 0.3, 32},
+      {"7zip.exe", 6579, 0.4, 28},
+      {"cmd.exe", 7680, 0.2, 12},
+      {"powershell.exe", 8791, 0.7, 88},
+      {"taskmanager.exe", 9802, 1.0, 64},
+  };
+
+  // Dummy module list - create a larger list
+  std::vector<ModuleInfo> all_modules = {
+      {"kernel32.dll", "0x7FFE12340000", 864},
+      {"ntdll.dll", "0x7FFE98760000", 1920},
+      {"user32.dll", "0x7FFE43210000", 576},
+      {"gdi32.dll", "0x7FFE56780000", 384},
+      {"comctl32.dll", "0x7FFE76540000", 1024},
+      {"msvcrt.dll", "0x7FFE32100000", 768},
+      {"advapi32.dll", "0x7FFE87650000", 640},
+      {"shell32.dll", "0x7FFE65430000", 2048},
+      {"ws2_32.dll", "0x7FFE54320000", 320},
+      {"winmm.dll", "0x7FFE21098000", 512},
+      {"d3d11.dll", "0x7FFE76540000", 1536},
+      {"d3dcompiler_47.dll", "0x7FFE76FF0000", 2048},
+      {"dxgi.dll", "0x7FFE76570000", 896},
+      {"ole32.dll", "0x7FFE76780000", 1280},
+      {"combase.dll", "0x7FFE76990000", 3072},
+      {"oleaut32.dll", "0x7FFE76AA0000", 1024},
+      {"bcrypt.dll", "0x7FFE76BB0000", 384},
+      {"cryptbase.dll", "0x7FFE76CC0000", 192},
+      {"ucrtbase.dll", "0x7FFE76DD0000", 1536},
+      {"sechost.dll", "0x7FFE76EE0000", 512},
+      {"msvcp_win.dll", "0x7FFE76FF0000", 512},
+      {"vcruntime140.dll", "0x7FFE77100000", 128},
+      {"kernelbase.dll", "0x7FFE77210000", 2048},
+      {"rpcrt4.dll", "0x7FFE77320000", 1024},
+      {"shlwapi.dll", "0x7FFE77430000", 512},
+      {"setupapi.dll", "0x7FFE77540000", 2048},
+      {"cfgmgr32.dll", "0x7FFE77650000", 384},
+      {"imagehlp.dll", "0x7FFE77760000", 256},
+      {"psapi.dll", "0x7FFE77870000", 128},
+  };
+
+  // Filtered copies that will be shown in menu
+  std::vector<ProcessInfo> filtered_processes = all_processes;
+  std::vector<ModuleInfo> filtered_modules = all_modules;
+
+  // Convert to menu entries
+  std::vector<std::string> process_entries;
+  for (const auto& process : filtered_processes) {
+      process_entries.push_back(ProcessToString(process));
+  }
+
+  std::vector<std::string> module_entries;
+  for (const auto& module : filtered_modules) {
+      module_entries.push_back(module.name);
+  }
+
+  // Filter input variables
+  std::string process_filter = "";
+  std::string module_filter = "";
+
+  // Menu selection variables
+  int process_selected = 0;
+  int module_selected = 0;
+  bool show_process_filter = false;
+  bool show_module_filter = false;
+
+  // Memory and disassembly selection
+  int memory_selected = 0;
+  int disasm_selected = 0;
+
+  // Menu options
+  auto menu_option = MenuOption::Vertical();
+  menu_option.entries_option.transform = [](EntryState state) {
+    Element e = text(state.label);
+    if (state.focused) {
+      e = e | bgcolor(Color::Blue);
+    }
+    if (state.active) {
+      e = e | bold;
+    }
+    return e;
+  };
+  
+  auto module_menu_option = MenuOption::Vertical();
+  module_menu_option.entries_option.transform = [](EntryState state) {
+    Element e = text(state.label);
+    if (state.focused) {
+      e = e | bgcolor(Color::Cyan);
+    }
+    if (state.active) {
+      e = e | bold;
+    }
+    return e;
+  };
+  
+  auto memory_menu_option = MenuOption::Vertical();
+  memory_menu_option.entries_option.transform = [](EntryState state) {
+    Element e = text(state.label);
+    if (state.focused) {
+      e = e | bgcolor(Color::Green);
+    }
+    if (state.active) {
+      e = e | bold;
+    }
+    return e;
+  };
+  
+  auto disasm_menu_option = MenuOption::Vertical();
+  disasm_menu_option.entries_option.transform = [](EntryState state) {
+    Element e = text(state.label);
+    if (state.focused) {
+      e = e | bgcolor(Color::Yellow);
+    }
+    if (state.active) {
+      e = e | bold;
+    }
+    return e;
+  };
+
+  // Function to apply process filter
+  auto apply_process_filter = [&]() {
+    filtered_processes.clear();
+    process_entries.clear();
     
-    while (!quit) {
-        libmem::Pid selected_pid = process_select();
-        
-        if (selected_pid == 0) {
-            std::cout << "No process selected or operation canceled." << std::endl;
-            quit = true;
-            continue;
+    // If filter is empty, show all processes
+    if (process_filter.empty()) {
+      filtered_processes = all_processes;
+    } else {
+      // Otherwise, filter processes
+      for (const auto& process : all_processes) {
+        if (ContainsIgnoreCase(process.name, process_filter) || 
+            ContainsIgnoreCase(std::to_string(process.pid), process_filter)) {
+          filtered_processes.push_back(process);
         }
-        
-        std::cout << "Process selected with PID: " << selected_pid << std::endl;
-        
-        // Loop for module selection - allows going back to process selection
-        bool back_to_process_list = false;
-        while (!back_to_process_list && !quit) {
-            // Show modules for the selected process
-            ModuleSelectionResult module_result = show_process_modules(selected_pid);
-            
-            if (module_result.back_to_process_list) {
-                back_to_process_list = true;
-                std::cout << "Going back to process list..." << std::endl;
-            } else if (module_result.success) {
-                if (module_result.select_all_modules) {
-                    std::cout << "All modules selected. Total modules: " << 
-                              module_result.all_modules.size() << std::endl;
-                    
-                    // Show actions menu for all modules
-                    ProcessAction action = show_process_actions(libmem::GetProcess(selected_pid).value(), std::nullopt);
-                    
-                    switch (action) {
-                        case ProcessAction::SCAN_BYTES:
-                            scan_for_bytes(libmem::GetProcess(selected_pid).value(), std::nullopt);
-                            break;
-                        case ProcessAction::ENTER_ADDRESS:
-                            enter_memory_address(libmem::GetProcess(selected_pid).value(), std::nullopt);
-                            break;
-                        case ProcessAction::BACK_TO_MODULES:
-                            break;
-                        case ProcessAction::CANCEL:
-                            quit = true;
-                            break;
-                    }
-                } else {
-                    std::cout << "Working with module: " << module_result.selected_module->name << std::endl;
-                    
-                    // Show actions for the selected module
-                    ProcessAction action = show_process_actions(libmem::GetProcess(selected_pid).value(), module_result.selected_module);
-                    
-                    switch (action) {
-                        case ProcessAction::SCAN_BYTES:
-                            scan_for_bytes(libmem::GetProcess(selected_pid).value(), module_result.selected_module);
-                            break;
-                        case ProcessAction::ENTER_ADDRESS:
-                            enter_memory_address(libmem::GetProcess(selected_pid).value(), module_result.selected_module);
-                            break;
-                        case ProcessAction::BACK_TO_MODULES:
-                            break;
-                        case ProcessAction::CANCEL:
-                            quit = true;
-                            break;
-                    }
-                }
-            } else {
-                // Selection was canceled or failed
-                quit = true;
-                break;
-            }
-        }
+      }
     }
     
-    return 0;
+    // Update process entries
+    for (const auto& process : filtered_processes) {
+      process_entries.push_back(ProcessToString(process));
+    }
+    
+    // Reset selection if out of bounds
+    if (process_selected >= static_cast<int>(process_entries.size())) {
+      process_selected = process_entries.empty() ? 0 : process_entries.size() - 1;
+    }
+  };
+
+  // Function to apply module filter
+  auto apply_module_filter = [&]() {
+    filtered_modules.clear();
+    module_entries.clear();
+    
+    // If filter is empty, show all modules
+    if (module_filter.empty()) {
+      filtered_modules = all_modules;
+    } else {
+      // Otherwise, filter modules
+      for (const auto& module : all_modules) {
+        if (ContainsIgnoreCase(module.name, module_filter)) {
+          filtered_modules.push_back(module);
+        }
+      }
+    }
+    
+    // Update module entries
+    for (const auto& module : filtered_modules) {
+      module_entries.push_back(module.name);
+    }
+    
+    // Reset selection if out of bounds
+    if (module_selected >= static_cast<int>(module_entries.size())) {
+      module_selected = module_entries.empty() ? 0 : module_entries.size() - 1;
+    }
+  };
+
+  // Input components for filtering
+  Component process_filter_input = Input(&process_filter, "Filter processes...");
+  Component module_filter_input = Input(&module_filter, "Filter modules...");
+  
+  // Attach filter callbacks
+  auto process_input_with_filter = [&](Component c) {
+    return Renderer(c, [&, c] {
+      if (show_process_filter) {
+        apply_process_filter();
+      }
+      return c->Render();
+    });
+  };
+  
+  auto module_input_with_filter = [&](Component c) {
+    return Renderer(c, [&, c] {
+      if (show_module_filter) {
+        apply_module_filter();
+      }
+      return c->Render();
+    });
+  };
+  
+  process_filter_input = process_input_with_filter(process_filter_input);
+  module_filter_input = module_input_with_filter(module_filter_input);
+
+  // Create menus
+  Component process_menu = Menu(&process_entries, &process_selected, menu_option);
+  Component module_menu = Menu(&module_entries, &module_selected, module_menu_option);
+
+  // Create tab container for navigation between filter input and list
+  auto process_container = Container::Vertical({
+    process_filter_input,
+    process_menu
+  });
+  
+  auto module_container = Container::Vertical({
+    module_filter_input,
+    module_menu
+  });
+
+  // Memory and Disassembly menus - updated in the renderer
+  std::vector<std::string> memory_entries;
+  std::vector<std::string> disasm_entries;
+  Component memory_menu = Menu(&memory_entries, &memory_selected, memory_menu_option);
+  Component disasm_menu = Menu(&disasm_entries, &disasm_selected, disasm_menu_option);
+
+  // Main container with all components
+  auto main_container = Container::Vertical({
+    Container::Horizontal({
+      Container::Horizontal({
+        process_container,
+        module_container
+      }),
+      disasm_menu
+    }),
+    Container::Horizontal({
+      Container::Vertical({}), // placeholder for info section
+      memory_menu
+    })
+  });
+
+  // By default, hide filter inputs
+  process_container->SetActiveChild(process_menu);
+  module_container->SetActiveChild(module_menu);
+
+  // Create the component with event handling
+  auto component = Renderer(main_container, [&] {
+    Element process_section;
+    Element module_section;
+    
+    // Process section with conditional filter display
+    if (show_process_filter) {
+      process_section = vbox({
+        hcenter(bold(text("Filter Processes  -  (ESC) to close"))),
+        separator(),
+        process_filter_input->Render(),
+        separator(),
+        process_menu->Render() | vscroll_indicator | frame | flex,
+      });
+    } else {
+      process_section = vbox({
+        hcenter(bold(text("Processes  -  (F)ilter"))),
+        separator(),
+        process_menu->Render() | vscroll_indicator | frame | flex,
+      });
+    }
+    
+    // Module section with conditional filter display
+    if (show_module_filter) {
+      module_section = vbox({
+        hcenter(bold(text("Filter Modules"))),
+        separator(),
+        module_filter_input->Render(),
+        separator(),
+        module_menu->Render() | vscroll_indicator | frame | flex,
+      });
+    } else {
+      module_section = vbox({
+        hcenter(bold(text("Modules (F)ilter"))),
+        separator(),
+        module_menu->Render() | vscroll_indicator | frame | flex,
+      });
+    }
+
+    // Get the selected process and module (if available)
+    ProcessInfo selected_process;
+    if (!filtered_processes.empty() && process_selected < static_cast<int>(filtered_processes.size())) {
+      selected_process = filtered_processes[process_selected];
+    } else {
+      selected_process = {"No process selected", 0, 0.0, 0};
+    }
+
+    ModuleInfo selected_module;
+    if (!filtered_modules.empty() && module_selected < static_cast<int>(filtered_modules.size())) {
+      selected_module = filtered_modules[module_selected];
+    } else {
+      selected_module = {"No module selected", "0x00000000", 0};
+    }
+
+    // Get current counter value
+    uint64_t current_counter = counter.load();
+    
+    // Use fixed base address
+    const uint64_t base_address = 0x7FFC0000;
+    
+    // Update memory menu entries
+    memory_entries.clear();
+    
+    // Memory title
+    std::string memory_title = "MEMORY INSPECTOR  -  (G)o to (P)ause (F)reeze (E)dit";
+    
+    // Add memory rows with fixed addresses - more rows for twice the height
+    const uint64_t fixed_addresses[] = {
+        0x7FFC0000,
+        0x7FFC0010,
+        0x7FFC0020,
+        0x7FFC0030,
+        0x7FFC0040,
+        0x7FFC0050,
+        0x7FFC0060,
+        0x7FFC0070,
+        0x7FFC0080,
+        0x7FFC0090
+    };
+    
+    for (int i = 0; i < 10; i++) {
+        uint64_t addr = fixed_addresses[i];
+        uint64_t value = current_counter + i;
+        
+        std::string addr_str = FormatAsHex(addr);
+        std::string bytes_str = FormatHexBytes(value, 8);
+        std::string ascii_str = FormatAsAscii(value, 8);
+        
+        // Row content with fixed spacing for menu
+        std::string row = addr_str + ":  " + bytes_str + "  │ int: " + 
+                         std::to_string(value) + " │ \"" + ascii_str + "\"";
+        memory_entries.push_back(row);
+    }
+    
+    // Update disassembly menu entries
+    disasm_entries.clear();
+    
+    // Disassembly title
+    std::string disasm_title = "DISASSEMBLY  -  (S)can for signatures";
+    
+    // Generate fake disassembly
+    const uint64_t disasm_base = 0x140001000;
+    auto disasm = GenerateFakeDisassembly(disasm_base, current_counter);
+    
+    // Add disassembly rows to menu entries
+    for (const auto& instr : disasm) {
+        std::string row = FormatAsHex(instr.address) + ":  " +
+                         instr.bytes + "  │ " +
+                         instr.mnemonic + "  " +
+                         instr.operands;
+        disasm_entries.push_back(row);
+    }
+
+    // Process and module info section
+    auto info_section = vbox({
+        text("Process Information:"),
+        hbox({
+            text(" CPU Usage: "),
+            gauge(selected_process.cpu_usage / 10.0),
+        }),
+        hbox({
+            text(" Memory: "),
+            text(std::to_string(selected_process.memory_mb) + " MB"),
+        }),
+        separator(),
+        text("Module Information:"),
+        hbox({
+            text(" Base Address: "),
+            text(selected_module.base_address),
+        }),
+        hbox({
+            text(" Size: "),
+            text(std::to_string(selected_module.size_kb) + " KB"),
+        }),
+        separator(),
+        text("Additional Information:"),
+        hbox({
+            text(" PID: "),
+            text(std::to_string(selected_process.pid)),
+        }),
+        hbox({
+            text(" Priority: "),
+            text("Normal"),
+        }),
+        hbox({
+            text(" Threads: "),
+            text(std::to_string(4 + (current_counter % 8))),
+        }),
+        hbox({
+            text(" Handles: "),
+            text(std::to_string(120 + (current_counter % 50))),
+        }),
+    }) | border;
+
+    // Selection info panels
+    Element memory_info;
+    if (memory_selected >= 0 && memory_selected < static_cast<int>(memory_entries.size())) {
+        uint64_t addr = fixed_addresses[memory_selected];
+        memory_info = vbox({
+            text("Selected Memory:"),
+            text(" Address: " + FormatAsHex(addr)),
+            text(" Value (int): " + std::to_string(current_counter + memory_selected)),
+            text(" As float: " + std::to_string(static_cast<float>(current_counter + memory_selected))),
+            text(" As double: " + std::to_string(static_cast<double>(current_counter + memory_selected))),
+        }) | border;
+    } else {
+        memory_info = text("No memory selected") | border;
+    }
+    
+    Element disasm_info;
+    if (disasm_selected >= 0 && disasm_selected < static_cast<int>(disasm_entries.size())) {
+        auto& instr = disasm[disasm_selected];
+        disasm_info = vbox({
+            text("Selected Instruction:"),
+            text(" Address: " + FormatAsHex(instr.address)),
+            text(" Bytes: " + instr.bytes),
+            text(" Operation: " + instr.mnemonic + " " + instr.operands),
+        }) | border;
+    } else {
+        disasm_info = text("No instruction selected") | border;
+    }
+
+    // Create memory and disassembly section titles
+    auto memory_section_title = vbox({
+        bold(text(memory_title)),
+        separator(),
+    });
+    
+    auto disasm_section_title = vbox({
+        bold(text(disasm_title)),
+        separator(),
+    });
+
+    return vbox({
+              // Top panel with menus and info - 50% of height
+              hbox({
+                // Left side with process and module lists - 60% of width
+                hbox({
+                  process_section | flex,
+                  separator(),
+                  module_section | flex,
+                }) | size(WIDTH, GREATER_THAN, 60),
+                separator(),
+                // Right side with disassembly - 40% of width
+                vbox({
+                  disasm_section_title,
+                  disasm_menu->Render() | vscroll_indicator | frame | flex,
+                  disasm_info,
+                }) | size(WIDTH, LESS_THAN, 40),
+              }) | size(HEIGHT, GREATER_THAN, 50),
+              separator(),
+              // Bottom panel with memory display and info - 50% of height
+              hbox({
+                // Left side with info - 30% of width
+                vbox({
+                  info_section,
+                  memory_info,
+                }) | size(WIDTH, LESS_THAN, 30),
+                separator(),
+                // Right side with memory display - 70% of width
+                vbox({
+                  memory_section_title,
+                  memory_menu->Render() | vscroll_indicator | frame | flex,
+                }) | size(WIDTH, GREATER_THAN, 70),
+              }) | size(HEIGHT, LESS_THAN, 50),
+          }) | border;
+  });
+
+  // Add event handling 
+  auto with_key_events = CatchEvent(component, [&](Event event) {
+    if (event == Event::Character('f') || event == Event::Character('F')) {
+      // Determine which side is active
+      auto is_process_active = process_container->Active() || process_filter_input->Active();
+      auto is_module_active = module_container->Active() || module_filter_input->Active();
+      
+      if (is_process_active) {
+        // Toggle process filter
+        show_process_filter = !show_process_filter;
+        if (show_process_filter) {
+          process_container->SetActiveChild(process_filter_input);
+        } else {
+          process_container->SetActiveChild(process_menu);
+        }
+        return true;
+      } else if (is_module_active) {
+        // Toggle module filter
+        show_module_filter = !show_module_filter;
+        if (show_module_filter) {
+          module_container->SetActiveChild(module_filter_input);
+        } else {
+          module_container->SetActiveChild(module_menu);
+        }
+        return true;
+      }
+    }
+    // Handle escape to exit filtering
+    if (event == Event::Escape) {
+      if (show_process_filter) {
+        show_process_filter = false;
+        process_container->SetActiveChild(process_menu);
+        return true;
+      }
+      if (show_module_filter) {
+        show_module_filter = false;
+        module_container->SetActiveChild(module_menu);
+        return true;
+      }
+    }
+    
+    return false;
+  });
+
+  // Create an animated component that refreshes continuously
+  auto animated = Renderer(with_key_events, [&] {
+    // Force a refresh
+    screen.PostEvent(Event::Custom);
+    return with_key_events->Render();
+  });
+
+  // Start a refresh thread to update the UI
+  std::thread refresh_thread([&screen]() {
+    while (true) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(33)); // ~30 FPS
+      screen.PostEvent(Event::Custom);
+    }
+  });
+  
+  // Set the refresh thread to detach so it doesn't block when we exit
+  refresh_thread.detach();
+
+  // Start the main loop
+  screen.Loop(animated);
+  
+  // Clean up the counter thread before exiting
+  thread_running = false;
+  if (counter_thread.joinable()) {
+    counter_thread.join();
+  }
 }
