@@ -176,6 +176,44 @@ std::string parse_signature(const std::string& signature) {
 // ========================== Memory Manipulation Functions ==========================
 
 /**
+ * Helper function to update memory display lines
+ */
+void updateMemoryDisplay(std::vector<std::string>& memory_lines, const std::vector<uint8_t>& buffer, libmem::Address base_address, size_t size) {
+    memory_lines.clear();
+    const int bytes_per_row = 16;
+    
+    for (size_t offset = 0; offset < size; offset += bytes_per_row) {
+        libmem::Address row_addr = base_address + offset;
+        size_t row_size = std::min(size_t(bytes_per_row), size - offset);
+        
+        std::stringstream ss;
+        ss << FormatAsHex(row_addr, 16) << ": ";
+        
+        // Hex bytes
+        for (size_t i = 0; i < row_size; i++) {
+            ss << std::setfill('0') << std::setw(2) << std::hex << (int)buffer[offset + i] << " ";
+            if (i == 7) ss << " "; // Extra space after 8 bytes
+        }
+        
+        // Pad with spaces if row is incomplete
+        for (size_t i = row_size; i < bytes_per_row; i++) {
+            ss << "   ";
+            if (i == 7) ss << " ";
+        }
+        
+        ss << " | ";
+        
+        // ASCII representation
+        for (size_t i = 0; i < row_size; i++) {
+            char c = buffer[offset + i];
+            ss << (c >= 32 && c <= 126 ? c : '.');
+        }
+        
+        memory_lines.push_back(ss.str());
+    }
+}
+
+/**
  * Disassembles memory at the specified address
  * 
  * @param process The target process
@@ -195,56 +233,98 @@ bool disassemble_memory_region(const libmem::Process& process, libmem::Address a
     
     // Disassemble memory
     try {
-        // Read memory from the process - use correct API
-        std::vector<uint8_t> memory_buffer(instruction_count * 16); // Average instruction size is less than 16 bytes
-        bool read_success = true;
+        // Read memory from the process - use correct API with buffer
+        std::vector<uint8_t> memory_buffer(128, 0); // Larger buffer to capture multiple instructions
+        size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), memory_buffer.size());
         
-        // Read memory one byte at a time using template version
-        for (size_t i = 0; i < memory_buffer.size(); i++) {
-            try {
-                memory_buffer[i] = libmem::ReadMemory<uint8_t>(address + i);
-            } catch (...) {
-                // If we can't read, fill with zero
-                memory_buffer[i] = 0;
-                read_success = false;
-            }
-        }
-        
-        if (!read_success) {
-            status_message = "Failed to read some memory at address " + FormatAsHex(address);
-        }
-        
-        if (memory_buffer.empty()) {
+        if (bytes_read < 16) { // Need at least a few bytes for meaningful disassembly
             status_message = "Failed to read memory at address " + FormatAsHex(address);
-            return false;
-        }
-        
-        // Convert to disassembly lines
-        size_t total_bytes_read = 0;
-        libmem::Address current_address = address;
-        
-        // In real implementation, use a disassembler library
-        // For now, just display hex bytes as placeholder
-        for (int i = 0; i < instruction_count && total_bytes_read < memory_buffer.size(); i++) {
-            size_t bytes_for_instr = std::min(size_t(16), memory_buffer.size() - total_bytes_read);
-            std::string bytes_str;
+            disasm_lines.push_back("Error: Memory not accessible");
+            disasm_lines.push_back("Address: " + FormatAsHex(address));
+        } else {
+            status_message = "Read " + std::to_string(bytes_read) + " bytes from memory";
             
-            for (size_t j = 0; j < bytes_for_instr; j++) {
-                if (j > 0) bytes_str += " ";
-                bytes_str += std::to_string(memory_buffer[total_bytes_read + j]);
+            // Get architecture for proper disassembly
+            libmem::Arch arch = libmem::GetArchitecture();
+            
+            libmem::Address current_addr = address;
+            int instructions_found = 0;
+            
+            // Disassemble instruction by instruction
+            while (instructions_found < instruction_count) {
+                // Calculate offset into our memory buffer
+                size_t offset = current_addr - address;
+                
+                // If we've gone beyond what we read, we need to stop
+                if (offset >= bytes_read) {
+                    disasm_lines.push_back("--- End of readable memory ---");
+                    break;
+                }
+                
+                // Prepare buffer for disassembly
+                std::vector<uint8_t> disasm_buffer(16, 0);
+                size_t bytes_to_copy = std::min<size_t>(16, bytes_read - offset);
+                std::copy(memory_buffer.data() + offset, memory_buffer.data() + offset + bytes_to_copy, disasm_buffer.data());
+                
+                // Try to disassemble this chunk as a single instruction
+                auto disasm_result = libmem::Disassemble(
+                    reinterpret_cast<libmem::Address>(disasm_buffer.data()),
+                    arch,
+                    bytes_to_copy,
+                    1,  // instruction count = 1
+                    current_addr  // use original address for display
+                );
+                
+                if (!disasm_result.has_value() || disasm_result->empty()) {
+                    // Failed to disassemble, show raw bytes
+                    std::stringstream ss;
+                    ss << FormatAsHex(current_addr) << ": [Invalid] ";
+                    for (size_t i = 0; i < std::min<size_t>(4, bytes_to_copy); i++) {
+                        ss << std::setfill('0') << std::setw(2) << std::hex << (int)disasm_buffer[i] << " ";
+                    }
+                    disasm_lines.push_back(ss.str());
+                    current_addr += 1; // Move forward by one byte
+                    continue;
+                }
+                
+                // Get the instruction
+                const auto& inst = disasm_result->front();
+                
+                // Format instruction for display
+                std::stringstream ss;
+                ss << FormatAsHex(current_addr, 16) << ": ";
+                
+                // Add bytes in hex
+                ss << "[ ";
+                for (size_t i = 0; i < inst.bytes.size(); i++) {
+                    ss << std::setfill('0') << std::setw(2) << std::hex << (int)inst.bytes[i] << " ";
+                }
+                ss << "] ";
+                
+                // Add mnemonic and operands
+                ss << inst.mnemonic;
+                if (!inst.op_str.empty()) {
+                    ss << " " << inst.op_str;
+                }
+                
+                disasm_lines.push_back(ss.str());
+                
+                // Check if this is a return instruction
+                if (inst.mnemonic.find("ret") != std::string::npos) {
+                    disasm_lines.push_back("--- Return instruction found ---");
+                    break;
+                }
+                
+                // Move to next instruction
+                current_addr += inst.bytes.size();
+                instructions_found++;
             }
             
-            std::string line = FormatAsHex(current_address) + ": " + bytes_str;
-            disasm_lines.push_back(line);
-            
-            current_address += bytes_for_instr;
-            total_bytes_read += bytes_for_instr;
+            status_message = "Disassembled " + std::to_string(instructions_found) + " instructions";
         }
-        
-        status_message = "Disassembly complete - " + std::to_string(disasm_lines.size()) + " instructions";
     } catch (const std::exception& e) {
         status_message = "Error: " + std::string(e.what());
-        return false;
+        disasm_lines.push_back("Exception: " + std::string(e.what()));
     }
     
     // Create renderer for the disassembly view
@@ -285,40 +365,30 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
     // Setup UI components for memory watch
     auto screen = ScreenInteractive::TerminalOutput();
     std::vector<std::string> memory_lines;
-    std::vector<uint64_t> memory_values;
+    std::vector<uint8_t> memory_buffer(size, 0);
+    std::vector<uint8_t> frozen_buffer(size, 0);
     std::string status_message = "Watching memory...";
     int selected_index = 0;
     bool is_running = true;
     bool paused = false;
     bool freeze_value = false;
-    std::vector<uint64_t> frozen_buffer;
-    
-    // Maximum rows to display
-    const int max_rows = 16;
-    const int bytes_per_row = 16;
-    size = std::min(size_t(max_rows * bytes_per_row), size);
     
     // Read initial memory values
     try {
-        memory_values.resize(size / sizeof(uint64_t) + 1, 0);
-        for (size_t i = 0; i < memory_values.size(); i++) {
-            libmem::Address curr_addr = address + (i * sizeof(uint64_t));
-            memory_values[i] = libmem::ReadMemory<uint64_t>(curr_addr);
-        }
+        size_t bytes_read = libmem::ReadMemory(&process, address, memory_buffer.data(), size);
         
-        if (memory_values.empty()) {
-            status_message = "Failed to read memory at address " + FormatAsHex(address);
+        if (bytes_read != size) {
+            status_message = "Failed to read memory at address " + FormatAsHex(address) + " (read " + std::to_string(bytes_read) + "/" + std::to_string(size) + " bytes)";
             return false;
         }
         
+        // Initialize frozen buffer
+        frozen_buffer = memory_buffer;
+        
         // Generate initial display
-        for (size_t i = 0; i < memory_values.size(); i++) {
-            libmem::Address row_addr = address + (i * sizeof(uint64_t));
-            std::string line = FormatAsHex(row_addr) + ": " + 
-                              FormatHexBytes(memory_values[i], sizeof(uint64_t)) + "  " +
-                              FormatAsAscii(memory_values[i], sizeof(uint64_t));
-            memory_lines.push_back(line);
-        }
+        updateMemoryDisplay(memory_lines, memory_buffer, address, size);
+        
+        status_message = "Successfully reading " + std::to_string(size) + " bytes from " + FormatAsHex(address);
     } catch (const std::exception& e) {
         status_message = "Error: " + std::string(e.what());
         return false;
@@ -327,7 +397,9 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
     // Prepare component for memory display
     auto menu_option = MenuOption();
     menu_option.on_change = [&] { 
+        if (selected_index < memory_lines.size()) {
         status_message = "Selected: " + memory_lines[selected_index];
+        }
     };
     
     auto memory_component = Menu(&memory_lines, &selected_index, menu_option);
@@ -335,8 +407,8 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
     // Value type and edit features
     std::string edit_value;
     bool editing = false;
-    int type_index = 0; // 0=int64, 1=float, 2=double, 3=bytes
-    std::vector<std::string> type_names = {"int64_t", "float", "double", "bytes"};
+    int type_index = 0; // 0=int32, 1=uint32, 2=float, 3=double, 4=bytes
+    std::vector<std::string> type_names = {"int32", "uint32", "float", "double", "bytes"};
     
     auto input_component = Input(&edit_value, "Enter new value");
     auto type_selector = Radiobox(&type_names, &type_index);
@@ -349,87 +421,92 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
         }
         
         try {
-            // Calculate address of selected item
-            libmem::Address target_addr = address + (selected_index * sizeof(uint64_t));
-            uint64_t value = 0;
+            // Calculate byte offset for selected row
+            size_t row_offset = (selected_index * 16) % size;
+            std::vector<uint8_t> new_bytes = memory_buffer; // Copy current buffer
             
             // Convert based on type
             switch (type_index) {
-                case 0: { // int64
-                    std::istringstream iss(input_value);
-                    int64_t int_val;
-                    
-                    // Try to parse as hex if it starts with 0x
-                    if (input_value.substr(0, 2) == "0x") {
-                        iss >> std::hex >> int_val;
+                case 0: { // int32
+                    int32_t int_val = std::stoi(input_value);
+                    if (row_offset + sizeof(int32_t) <= size) {
+                        std::memcpy(new_bytes.data() + row_offset, &int_val, sizeof(int32_t));
                     } else {
-                        iss >> int_val;
+                        status_message = "Not enough space for int32";
+                        return false;
                     }
-                    
-                    value = static_cast<uint64_t>(int_val);
                     break;
                 }
-                case 1: { // float
+                case 1: { // uint32
+                    uint32_t uint_val = static_cast<uint32_t>(std::stoul(input_value));
+                    if (row_offset + sizeof(uint32_t) <= size) {
+                        std::memcpy(new_bytes.data() + row_offset, &uint_val, sizeof(uint32_t));
+                    } else {
+                        status_message = "Not enough space for uint32";
+                        return false;
+                    }
+                    break;
+                }
+                case 2: { // float
                     float float_val = std::stof(input_value);
-                    std::memcpy(&value, &float_val, sizeof(float));
+                    if (row_offset + sizeof(float) <= size) {
+                        std::memcpy(new_bytes.data() + row_offset, &float_val, sizeof(float));
+                    } else {
+                        status_message = "Not enough space for float";
+                        return false;
+                    }
                     break;
                 }
-                case 2: { // double
+                case 3: { // double
                     double double_val = std::stod(input_value);
-                    std::memcpy(&value, &double_val, sizeof(double));
+                    if (row_offset + sizeof(double) <= size) {
+                        std::memcpy(new_bytes.data() + row_offset, &double_val, sizeof(double));
+                    } else {
+                        status_message = "Not enough space for double";
+                        return false;
+                    }
                     break;
                 }
-                case 3: { // bytes (format: "AA BB CC DD")
+                case 4: { // bytes (format: "AA BB CC DD")
                     std::istringstream iss(input_value);
                     std::string byte_str;
-                    int byte_index = 0;
+                    size_t byte_index = 0;
                     
-                    while (iss >> byte_str && byte_index < 8) {
-                        // Convert hex string to byte
-                        uint8_t byte = static_cast<uint8_t>(std::stoi(byte_str, nullptr, 16));
-                        // Place in correct position in value
-                        value |= static_cast<uint64_t>(byte) << (byte_index * 8);
+                    while (iss >> byte_str && byte_index < 16 && (row_offset + byte_index) < size) {
+                        uint8_t byte = static_cast<uint8_t>(std::stoul(byte_str, nullptr, 16));
+                        new_bytes[row_offset + byte_index] = byte;
                         byte_index++;
                     }
                     break;
                 }
             }
             
-            // Apply the change
+            // Apply the change - FIXED VERSION
             if (freeze_value) {
-                // Just update the frozen buffer
-                memory_values[selected_index] = value;
+                // Update the frozen buffer and write it back to memory to maintain freeze
+                frozen_buffer = new_bytes;
+                memory_buffer = new_bytes; // Update display buffer
+                updateMemoryDisplay(memory_lines, memory_buffer, address, size);
                 
-                // Update display
-                libmem::Address row_addr = address + (selected_index * sizeof(uint64_t));
-                std::string line = FormatAsHex(row_addr) + ": " + 
-                                  FormatHexBytes(value, sizeof(uint64_t)) + "  " +
-                                  FormatAsAscii(value, sizeof(uint64_t));
-                memory_lines[selected_index] = line;
-                
-                status_message = "Value updated (frozen)";
+                // Write the frozen value back to memory to maintain the freeze
+                size_t bytes_written = libmem::WriteMemory(&process, address, frozen_buffer.data(), size);
+                if (bytes_written == size) {
+                    status_message = "Value changed and frozen";
+                } else {
+                    status_message = "Failed to write frozen value";
+                }
                 return true;
             } else {
                 // Write directly to memory
-                libmem::Address target_addr = address + (selected_index * sizeof(uint64_t));
-                try {
-                    // Use template version of WriteMemory
-                    libmem::WriteMemory<uint64_t>(target_addr, value);
-                    
-                    // Update our cached value
-                    memory_values[selected_index] = value;
-                    
-                    // Update display
-                    libmem::Address row_addr = address + (selected_index * sizeof(uint64_t));
-                    std::string line = FormatAsHex(row_addr) + ": " + 
-                                      FormatHexBytes(value, sizeof(uint64_t)) + "  " +
-                                      FormatAsAscii(value, sizeof(uint64_t));
-                    memory_lines[selected_index] = line;
-                    
-                    status_message = "Value updated successfully";
+                size_t bytes_written = libmem::WriteMemory(&process, address, new_bytes.data(), size);
+                
+                if (bytes_written == size) {
+                    memory_buffer = new_bytes; // Update our buffer
+                    updateMemoryDisplay(memory_lines, memory_buffer, address, size);
+                    status_message = "Value changed successfully";
                     return true;
-                } catch (const std::exception& e) {
-                    status_message = "Failed to write memory: " + std::string(e.what());
+                } else {
+                    status_message = "Failed to write memory (wrote " + std::to_string(bytes_written) + "/" + std::to_string(size) + " bytes)";
                     return false;
                 }
             }
@@ -439,71 +516,56 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
         }
     };
     
-    // Function to toggle freezing
+    // Function to toggle freezing - FIXED VERSION
     auto toggle_freeze = [&]() {
-        freeze_value = !freeze_value;
-        if (freeze_value) {
-            // Copy current values to frozen buffer
-            frozen_buffer = memory_values;
-            status_message = "Memory values frozen";
+        if (!freeze_value) {
+            // Freeze current values
+            frozen_buffer = memory_buffer;
+            freeze_value = true;
+            status_message = "Value frozen";
         } else {
-            status_message = "Memory values unfrozen";
+            // Unfreeze values
+            freeze_value = false;
+            status_message = "Value unfrozen";
         }
     };
     
-    // Update thread for real-time memory watching
+    // Update thread for real-time memory watching - FIXED VERSION
     std::atomic<bool> thread_running{true};
     std::thread update_thread([&]() {
         while (thread_running) {
             // Only update if not paused
             if (!paused && is_running) {
                 try {
-                    // Read current memory values
-                    std::vector<uint64_t> current_values(memory_values.size(), 0);
-                    for (size_t i = 0; i < current_values.size(); i++) {
-                        libmem::Address curr_addr = address + (i * sizeof(uint64_t));
-                        try {
-                            current_values[i] = libmem::ReadMemory<uint64_t>(curr_addr);
-                        } catch (...) {
-                            // Handle failure for this address
-                            current_values[i] = memory_values[i]; // Keep old value
-                        }
-                    }
-                    
-                    // If we have frozen values, write them back to memory
-                    if (freeze_value) {
-                        for (size_t i = 0; i < memory_values.size(); i++) {
-                            libmem::Address curr_addr = address + (i * sizeof(uint64_t));
-                            try {
-                                // Write frozen value back to memory
-                                libmem::WriteMemory<uint64_t>(curr_addr, frozen_buffer[i]);
-                                // Update display for frozen memory - shows what we're enforcing
-                                current_values[i] = frozen_buffer[i];
-                            } catch (...) {
-                                // Ignore write failures
+                    if (!freeze_value) {
+                        // Read current memory values only when not frozen
+                        std::vector<uint8_t> current_buffer(size, 0);
+                        size_t bytes_read = libmem::ReadMemory(&process, address, current_buffer.data(), size);
+                        
+                        if (bytes_read == size) {
+                            // Check for changes and update display
+                            bool changed = false;
+                            for (size_t i = 0; i < size; i++) {
+                                if (current_buffer[i] != memory_buffer[i]) {
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                            
+                            if (changed) {
+                                memory_buffer = current_buffer;
+                                updateMemoryDisplay(memory_lines, memory_buffer, address, size);
                             }
                         }
                     }
-                    
-                    // Check for changes and update display
-                    for (size_t i = 0; i < current_values.size(); i++) {
-                        if (current_values[i] != memory_values[i]) {
-                            // Value changed, update display
-                            libmem::Address row_addr = address + (i * sizeof(uint64_t));
-                            std::string line = FormatAsHex(row_addr) + ": " + 
-                                              FormatHexBytes(current_values[i], sizeof(uint64_t)) + "  " +
-                                              FormatAsAscii(current_values[i], sizeof(uint64_t));
-                            memory_lines[i] = line;
-                            memory_values[i] = current_values[i];
-                        }
-                    }
+                    // When frozen, do nothing - just keep displaying frozen values
                 } catch (...) {
                     // Ignore errors during update
                 }
             }
             
             // Sleep to avoid excessive CPU usage
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Reduced frequency
         }
     });
     
@@ -554,7 +616,8 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
         // Add the remaining elements
         elements.push_back(separator());
         elements.push_back(text(status_message));
-        elements.push_back(text("Controls: (E)dit value | (P)ause | (G)o to address | (ESC) Return") | color(Color::GrayDark));
+        std::string freeze_status = freeze_value ? " [FROZEN]" : "";
+        elements.push_back(text("Controls: (E)dit | (P)ause | (Z)Freeze" + freeze_status + " | (G)oto | (ESC)Return") | color(Color::GrayDark));
         
         return vbox(elements);
     });
@@ -590,26 +653,57 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
                 container->SetActiveChild(edit_container);
                 
                 // Prefill with current value based on type
-                uint64_t current_value = memory_values[selected_index];
+                size_t row_offset = (selected_index * 16) % size;
                 switch (type_index) {
-                    case 0: // int64
-                        edit_value = std::to_string(static_cast<int64_t>(current_value));
+                    case 0: { // int32
+                        if (row_offset + sizeof(int32_t) <= size) {
+                            int32_t int_val;
+                            std::memcpy(&int_val, memory_buffer.data() + row_offset, sizeof(int32_t));
+                            edit_value = std::to_string(int_val);
+                        } else {
+                            edit_value = "0";
+                        }
                         break;
-                    case 1: { // float
+                    }
+                    case 1: { // uint32
+                        if (row_offset + sizeof(uint32_t) <= size) {
+                            uint32_t uint_val;
+                            std::memcpy(&uint_val, memory_buffer.data() + row_offset, sizeof(uint32_t));
+                            edit_value = std::to_string(uint_val);
+                        } else {
+                            edit_value = "0";
+                        }
+                        break;
+                    }
+                    case 2: { // float
+                        if (row_offset + sizeof(float) <= size) {
                         float float_val;
-                        std::memcpy(&float_val, &current_value, sizeof(float));
+                            std::memcpy(&float_val, memory_buffer.data() + row_offset, sizeof(float));
                         edit_value = std::to_string(float_val);
+                        } else {
+                            edit_value = "0.0";
+                        }
                         break;
                     }
-                    case 2: { // double
+                    case 3: { // double
+                        if (row_offset + sizeof(double) <= size) {
                         double double_val;
-                        std::memcpy(&double_val, &current_value, sizeof(double));
+                            std::memcpy(&double_val, memory_buffer.data() + row_offset, sizeof(double));
                         edit_value = std::to_string(double_val);
+                        } else {
+                            edit_value = "0.0";
+                        }
                         break;
                     }
-                    case 3: // bytes
-                        edit_value = FormatHexBytes(current_value, sizeof(uint64_t));
+                    case 4: { // bytes
+                        std::stringstream ss;
+                        for (size_t i = 0; i < std::min(size_t(16), size - row_offset); i++) {
+                            if (i > 0) ss << " ";
+                            ss << std::setfill('0') << std::setw(2) << std::hex << (int)memory_buffer[row_offset + i];
+                        }
+                        edit_value = ss.str();
                         break;
+                    }
                 }
                 
                 return true;
@@ -618,9 +712,13 @@ bool watch_memory_region(const libmem::Process& process, libmem::Address address
                 paused = !paused;
                 status_message = paused ? "Watching paused" : "Watching resumed";
                 return true;
-            } else if (event == Event::Character('f') || event == Event::Character('F')) {
-                // Toggle freeze
+            } else if (event == Event::Character('z') || event == Event::Character('Z')) {
+                // Toggle freeze with Z key (instead of F which conflicts with Filter)
                 toggle_freeze();
+                return true;
+            } else if (event == Event::Character('g') || event == Event::Character('G')) {
+                // Go to address - simple implementation
+                status_message = "Go to address feature - enter address in hex (e.g., 0x12345678)";
                 return true;
             }
             return false;
@@ -669,9 +767,14 @@ SignatureScanResult scan_module_for_pattern(const libmem::Process& process,
             start_address = module->base;
             scan_size = module->size;
         } else {
-            // Placeholder for scanning entire process memory
-            // In a real app, would need to enumerate memory regions
+            // Scan first module if no module specified
+            auto modules_opt = libmem::EnumModules(&process);
+            if (!modules_opt.has_value() || modules_opt->empty()) {
             return result;
+            }
+            
+            start_address = modules_opt->front().base;
+            scan_size = modules_opt->front().size;
         }
         
         // Perform the signature scan using the correct API
@@ -682,8 +785,9 @@ SignatureScanResult scan_module_for_pattern(const libmem::Process& process,
             result.address = result_opt.value();
             result.matches.push_back(result_opt.value()); // Add the match
         }
-    } catch (const std::exception&) {
-        // Handle exceptions
+    } catch (const std::exception& e) {
+        // Handle exceptions - log the error for debugging
+        std::cerr << "Scan error: " << e.what() << std::endl;
         result.success = false;
     }
     
@@ -732,81 +836,39 @@ int main() {
   // Create a fullscreen interface
   auto screen = ScreenInteractive::Fullscreen();
 
-  // Counter for the background thread
-  std::atomic<uint64_t> counter{0};
-  std::atomic<bool> thread_running{true};
+  // Active panel tracking for navigation
+  enum class ActivePanel {
+    PROCESSES,
+    MODULES,
+    MEMORY,
+    DISASSEMBLY
+  };
+
+  ActivePanel active_panel = ActivePanel::PROCESSES;
+
+  // Real process list from libmem
+  std::vector<ProcessInfo> all_processes;
+  std::vector<libmem::Process> libmem_processes;
   
-  // Start a background thread that counts up
-  std::thread counter_thread([&counter, &thread_running]() {
-    while (thread_running) {
-      counter++;
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-  });
+  auto processes_opt = libmem::EnumProcesses();
+  if (processes_opt.has_value()) {
+      libmem_processes = processes_opt.value();
+      
+      // Convert libmem::Process to ProcessInfo for display
+      for (const auto& proc : libmem_processes) {
+          ProcessInfo info;
+          info.name = proc.name;
+          info.pid = proc.pid;
+          info.cpu_usage = 0.0f; // CPU usage not available in libmem
+          info.memory_mb = 0;    // Memory usage not available in libmem
+          all_processes.push_back(info);
+      }
+  }
 
-  // Dummy process list - create a larger list
-  std::vector<ProcessInfo> all_processes = {
-      {"chrome.exe", 1234, 5.2, 256},
-      {"explorer.exe", 2345, 1.8, 128},
-      {"notepad.exe", 3456, 0.5, 32},
-      {"spotify.exe", 4567, 3.2, 192},
-      {"discord.exe", 5678, 2.1, 160},
-      {"vscode.exe", 6789, 4.5, 224},
-      {"slack.exe", 7890, 1.9, 144},
-      {"firefox.exe", 8901, 4.8, 240},
-      {"steam.exe", 9012, 3.7, 208},
-      {"outlook.exe", 1023, 2.3, 176},
-      {"photoshop.exe", 2134, 6.7, 512},
-      {"vlc.exe", 3245, 1.2, 64},
-      {"winamp.exe", 4356, 0.8, 48},
-      {"word.exe", 5467, 2.5, 128},
-      {"excel.exe", 6578, 3.1, 196},
-      {"powerpoint.exe", 7689, 2.8, 180},
-      {"itunes.exe", 8790, 1.7, 120},
-      {"skype.exe", 9801, 1.4, 112},
-      {"telegram.exe", 1024, 1.1, 88},
-      {"whatsapp.exe", 2135, 1.3, 96},
-      {"malwarebytes.exe", 3246, 0.9, 120},
-      {"avast.exe", 4357, 1.6, 156},
-      {"winrar.exe", 5468, 0.3, 32},
-      {"7zip.exe", 6579, 0.4, 28},
-      {"cmd.exe", 7680, 0.2, 12},
-      {"powershell.exe", 8791, 0.7, 88},
-      {"taskmanager.exe", 9802, 1.0, 64},
-  };
-
-  // Dummy module list - create a larger list
-  std::vector<ModuleInfo> all_modules = {
-      {"kernel32.dll", "0x7FFE12340000", 864},
-      {"ntdll.dll", "0x7FFE98760000", 1920},
-      {"user32.dll", "0x7FFE43210000", 576},
-      {"gdi32.dll", "0x7FFE56780000", 384},
-      {"comctl32.dll", "0x7FFE76540000", 1024},
-      {"msvcrt.dll", "0x7FFE32100000", 768},
-      {"advapi32.dll", "0x7FFE87650000", 640},
-      {"shell32.dll", "0x7FFE65430000", 2048},
-      {"ws2_32.dll", "0x7FFE54320000", 320},
-      {"winmm.dll", "0x7FFE21098000", 512},
-      {"d3d11.dll", "0x7FFE76540000", 1536},
-      {"d3dcompiler_47.dll", "0x7FFE76FF0000", 2048},
-      {"dxgi.dll", "0x7FFE76570000", 896},
-      {"ole32.dll", "0x7FFE76780000", 1280},
-      {"combase.dll", "0x7FFE76990000", 3072},
-      {"oleaut32.dll", "0x7FFE76AA0000", 1024},
-      {"bcrypt.dll", "0x7FFE76BB0000", 384},
-      {"cryptbase.dll", "0x7FFE76CC0000", 192},
-      {"ucrtbase.dll", "0x7FFE76DD0000", 1536},
-      {"sechost.dll", "0x7FFE76EE0000", 512},
-      {"msvcp_win.dll", "0x7FFE76FF0000", 512},
-      {"vcruntime140.dll", "0x7FFE77100000", 128},
-      {"kernelbase.dll", "0x7FFE77210000", 2048},
-      {"rpcrt4.dll", "0x7FFE77320000", 1024},
-      {"shlwapi.dll", "0x7FFE77430000", 512},
-      {"setupapi.dll", "0x7FFE77540000", 2048},
-      {"cfgmgr32.dll", "0x7FFE77650000", 384},
-      {"imagehlp.dll", "0x7FFE77760000", 256},
-      {"psapi.dll", "0x7FFE77870000", 128},
-  };
+  // Module list - will be populated when a process is selected
+  std::vector<ModuleInfo> all_modules;
+  std::vector<libmem::Module> libmem_modules;
+  std::optional<libmem::Process> selected_process;
 
   // Filtered copies that will be shown in menu
   std::vector<ProcessInfo> filtered_processes = all_processes;
@@ -826,16 +888,27 @@ int main() {
   // Filter input variables
   std::string process_filter = "";
   std::string module_filter = "";
+  std::string signature_input = "";
+  std::string address_input = "";
 
   // Menu selection variables
   int process_selected = 0;
   int module_selected = 0;
   bool show_process_filter = false;
   bool show_module_filter = false;
+  bool show_signature_dialog = false;
+  bool show_address_dialog = false;
 
   // Memory and disassembly selection
   int memory_selected = 0;
   int disasm_selected = 0;
+
+  // Memory viewer state
+  libmem::Address current_memory_address = 0;
+  int memory_scroll_offset = 0;
+
+  // Status message
+  std::string status_message = "Select a process to begin";
 
   // Menu options
   auto menu_option = MenuOption::Vertical();
@@ -943,10 +1016,12 @@ int main() {
     }
   };
 
-  // Input components for filtering
+  // Input components for filtering and dialogs
   Component process_filter_input = Input(&process_filter, "Filter processes...");
   Component module_filter_input = Input(&module_filter, "Filter modules...");
-  
+  Component signature_input_component = Input(&signature_input, "Enter signature (e.g., 48 8D 64 24 ? C6 05)");
+  Component address_input_component = Input(&address_input, "Enter address (hex, e.g., 0x12345678)");
+
   // Attach filter callbacks
   auto process_input_with_filter = [&](Component c) {
     return Renderer(c, [&, c] {
@@ -956,7 +1031,7 @@ int main() {
       return c->Render();
     });
   };
-  
+
   auto module_input_with_filter = [&](Component c) {
     return Renderer(c, [&, c] {
       if (show_module_filter) {
@@ -965,7 +1040,7 @@ int main() {
       return c->Render();
     });
   };
-  
+
   process_filter_input = process_input_with_filter(process_filter_input);
   module_filter_input = module_input_with_filter(module_filter_input);
 
@@ -973,51 +1048,47 @@ int main() {
   Component process_menu = Menu(&process_entries, &process_selected, menu_option);
   Component module_menu = Menu(&module_entries, &module_selected, module_menu_option);
 
-  // Create tab container for navigation between filter input and list
-  auto process_container = Container::Vertical({
-    process_filter_input,
-    process_menu
-  });
-  
-  auto module_container = Container::Vertical({
-    module_filter_input,
-    module_menu
-  });
-
   // Memory and Disassembly menus - updated in the renderer
   std::vector<std::string> memory_entries;
   std::vector<std::string> disasm_entries;
   Component memory_menu = Menu(&memory_entries, &memory_selected, memory_menu_option);
   Component disasm_menu = Menu(&disasm_entries, &disasm_selected, disasm_menu_option);
 
-  // Main container with all components
-  auto main_container = Container::Vertical({
-    Container::Horizontal({
-      Container::Horizontal({
-        process_container,
-        module_container
-      }),
-      disasm_menu
-    }),
-    Container::Horizontal({
-      Container::Vertical({}), // placeholder for info section
-      memory_menu
-    })
+  // Create tab container for navigation between filter input and list
+  auto process_container = Container::Vertical({
+    process_filter_input,
+    process_menu
+  });
+
+  auto module_container = Container::Vertical({
+    module_filter_input,
+    module_menu
   });
 
   // By default, hide filter inputs
   process_container->SetActiveChild(process_menu);
   module_container->SetActiveChild(module_menu);
 
+  // Main container - NO NESTING, just the 4 panels
+  auto main_container = Container::Tab({
+    process_container,
+    module_container,
+    memory_menu,
+    disasm_menu
+  }, (int*)&active_panel);
+
   // Create the component with event handling
   auto component = Renderer(main_container, [&] {
-    Element process_section;
-    Element module_section;
-    
     // Process section with conditional filter display
+    Element process_section;
+    std::string process_title = show_process_filter ? "Filter Processes (ESC to close)" : "PROCESSES";
+    if (active_panel == ActivePanel::PROCESSES) {
+      process_title = "► " + process_title + " ◄";
+    }
+
     if (show_process_filter) {
       process_section = vbox({
-        hcenter(bold(text("Filter Processes  -  (ESC) to close"))),
+        text(process_title) | bold | color(active_panel == ActivePanel::PROCESSES ? Color::GreenLight : Color::White),
         separator(),
         process_filter_input->Render(),
         separator(),
@@ -1025,16 +1096,22 @@ int main() {
       });
     } else {
       process_section = vbox({
-        hcenter(bold(text("Processes  -  (F)ilter"))),
+        text(process_title) | bold | color(active_panel == ActivePanel::PROCESSES ? Color::GreenLight : Color::White),
         separator(),
         process_menu->Render() | vscroll_indicator | frame | flex,
       });
     }
-    
+
     // Module section with conditional filter display
+    Element module_section;
+    std::string module_title = show_module_filter ? "Filter Modules (ESC to close)" : "MODULES";
+    if (active_panel == ActivePanel::MODULES) {
+      module_title = "► " + module_title + " ◄";
+    }
+
     if (show_module_filter) {
       module_section = vbox({
-        hcenter(bold(text("Filter Modules"))),
+        text(module_title) | bold | color(active_panel == ActivePanel::MODULES ? Color::CyanLight : Color::White),
         separator(),
         module_filter_input->Render(),
         separator(),
@@ -1042,18 +1119,18 @@ int main() {
       });
     } else {
       module_section = vbox({
-        hcenter(bold(text("Modules (F)ilter"))),
+        text(module_title) | bold | color(active_panel == ActivePanel::MODULES ? Color::CyanLight : Color::White),
         separator(),
         module_menu->Render() | vscroll_indicator | frame | flex,
       });
     }
 
     // Get the selected process and module (if available)
-    ProcessInfo selected_process;
+    ProcessInfo selected_process_info;
     if (!filtered_processes.empty() && process_selected < static_cast<int>(filtered_processes.size())) {
-      selected_process = filtered_processes[process_selected];
+      selected_process_info = filtered_processes[process_selected];
     } else {
-      selected_process = {"No process selected", 0, 0.0, 0};
+      selected_process_info = {"No process selected", 0, 0.0, 0};
     }
 
     ModuleInfo selected_module;
@@ -1063,78 +1140,244 @@ int main() {
       selected_module = {"No module selected", "0x00000000", 0};
     }
 
-    // Get current counter value
-    uint64_t current_counter = counter.load();
-    
-    // Use fixed base address
-    const uint64_t base_address = 0x7FFC0000;
-    
     // Update memory menu entries
     memory_entries.clear();
-    
-    // Memory title
-    std::string memory_title = "MEMORY INSPECTOR  -  (G)o to (P)ause (F)reeze (E)dit";
-    
-    // Add memory rows with fixed addresses - more rows for twice the height
-    const uint64_t fixed_addresses[] = {
-        0x7FFC0000,
-        0x7FFC0010,
-        0x7FFC0020,
-        0x7FFC0030,
-        0x7FFC0040,
-        0x7FFC0050,
-        0x7FFC0060,
-        0x7FFC0070,
-        0x7FFC0080,
-        0x7FFC0090
-    };
-    
-    for (int i = 0; i < 10; i++) {
-        uint64_t addr = fixed_addresses[i];
-        uint64_t value = current_counter + i;
-        
-        std::string addr_str = FormatAsHex(addr);
-        std::string bytes_str = FormatHexBytes(value, 8);
-        std::string ascii_str = FormatAsAscii(value, 8);
-        
-        // Row content with fixed spacing for menu
-        std::string row = addr_str + ":  " + bytes_str + "  │ int: " + 
-                         std::to_string(value) + " │ \"" + ascii_str + "\"";
-        memory_entries.push_back(row);
+
+    // Memory title with active indicator and current address
+    std::string memory_title = "MEMORY";
+    if (active_panel == ActivePanel::MEMORY) {
+      memory_title = "► " + memory_title + " ◄";
+    }
+
+    // Add current viewing address to title if we have a process
+    if (selected_process.has_value() && !libmem_modules.empty()) {
+      libmem::Address view_addr = 0;
+      if (current_memory_address != 0) {
+        view_addr = current_memory_address + (memory_scroll_offset * 16);
+      } else if (module_selected >= 0 && module_selected < (int)libmem_modules.size()) {
+        view_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+      } else {
+        view_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+      }
+
+      std::stringstream ss;
+      ss << " @ 0x" << std::hex << std::setfill('0') << std::setw(12) << view_addr;
+      memory_title += ss.str();
+    }
+
+    // Only show memory if we have a selected process and modules
+    if (selected_process.has_value() && !libmem_modules.empty()) {
+        // Determine base address for memory display
+        libmem::Address display_addr = 0;
+
+        if (current_memory_address != 0) {
+            // Use user-specified address
+            display_addr = current_memory_address + (memory_scroll_offset * 16);
+        } else if (module_selected >= 0 && module_selected < static_cast<int>(libmem_modules.size())) {
+            // Use selected module's base address
+            display_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+        } else {
+            // Default to first module
+            display_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+        }
+
+        // Display 100 rows of memory (16 bytes each = 1600 bytes total)
+        for (int i = 0; i < 100; i++) {
+            libmem::Address addr = display_addr + (i * 16);
+
+            try {
+                std::vector<uint8_t> buffer(16, 0);
+                size_t bytes_read = libmem::ReadMemory(&selected_process.value(), addr, buffer.data(), 16);
+
+                if (bytes_read > 0) {
+                    // Format address as hex
+                    std::stringstream ss;
+                    ss << std::hex << std::setfill('0') << std::setw(12) << addr << ": ";
+
+                    // Hex bytes
+                    for (size_t j = 0; j < 16; j++) {
+                        if (j < bytes_read) {
+                            ss << std::hex << std::setfill('0') << std::setw(2) << (int)buffer[j] << " ";
+                        } else {
+                            ss << "?? ";
+                        }
+                        if (j == 7) ss << " "; // Extra space
+                    }
+
+                    ss << " │ ";
+
+                    // ASCII representation
+                    for (size_t j = 0; j < bytes_read && j < 16; j++) {
+                        char c = buffer[j];
+                        ss << (c >= 32 && c <= 126 ? c : '.');
+                    }
+
+                    memory_entries.push_back(ss.str());
+                } else {
+                    std::stringstream ss;
+                    ss << std::hex << std::setfill('0') << std::setw(12) << addr << ": [Access Denied]";
+                    memory_entries.push_back(ss.str());
+                }
+            } catch (const std::exception& e) {
+                std::stringstream ss;
+                ss << std::hex << std::setfill('0') << std::setw(12) << addr << ": [Error]";
+                memory_entries.push_back(ss.str());
+            }
+        }
+    } else {
+        memory_entries.push_back("Select a process and module to view memory");
     }
     
     // Update disassembly menu entries
     disasm_entries.clear();
-    
-    // Disassembly title
-    std::string disasm_title = "DISASSEMBLY  -  (S)can for signatures";
-    
-    // Generate fake disassembly
-    const uint64_t disasm_base = 0x140001000;
-    auto disasm = GenerateFakeDisassembly(disasm_base, current_counter);
-    
-    // Add disassembly rows to menu entries
-    for (const auto& instr : disasm) {
-        std::string row = FormatAsHex(instr.address) + ":  " +
-                         instr.bytes + "  │ " +
-                         instr.mnemonic + "  " +
-                         instr.operands;
-        disasm_entries.push_back(row);
+
+    // Disassembly title with active indicator
+    std::string disasm_title = "DISASSEMBLY";
+    if (active_panel == ActivePanel::DISASSEMBLY) {
+      disasm_title = "► " + disasm_title + " ◄";
     }
 
-    // Process and module info section
+    // Only show disassembly if we have a selected process and modules
+    if (selected_process.has_value() && !libmem_modules.empty()) {
+        // Disassemble at the selected memory address
+        libmem::Address disasm_base = 0;
+
+        // Calculate the address of the selected memory row
+        if (memory_selected >= 0 && memory_selected < (int)memory_entries.size()) {
+            // Use the same address calculation as the memory viewer
+            libmem::Address display_addr = 0;
+            if (current_memory_address != 0) {
+                display_addr = current_memory_address + (memory_scroll_offset * 16);
+            } else if (module_selected >= 0 && module_selected < (int)libmem_modules.size()) {
+                display_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+            } else {
+                display_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+            }
+
+            // Use the selected row's address
+            disasm_base = display_addr + (memory_selected * 16);
+        } else {
+            // Fallback to module base if no memory selected
+            disasm_base = libmem_modules[0].base;
+        }
+
+        // Add the disassembly address to the title
+        std::stringstream ss;
+        ss << " @ 0x" << std::hex << std::setfill('0') << std::setw(12) << disasm_base;
+        disasm_title += ss.str();
+        
+        // Generate real disassembly for more instructions
+        try {
+            // Read more memory from the process for better context
+            std::vector<uint8_t> memory_buffer(256, 0);
+            size_t bytes_read = libmem::ReadMemory(&selected_process.value(), disasm_base, memory_buffer.data(), memory_buffer.size());
+
+            if (bytes_read >= 16) {
+                // Get architecture for proper disassembly
+                libmem::Arch arch = libmem::GetArchitecture();
+
+                libmem::Address current_addr = disasm_base;
+                int instructions_found = 0;
+                const int max_instructions = 30; // Show 30 instructions for better context
+                
+                // Disassemble instruction by instruction
+                while (instructions_found < max_instructions) {
+                    // Calculate offset into our memory buffer
+                    size_t offset = current_addr - disasm_base;
+                    
+                    // If we've gone beyond what we read, we need to stop
+                    if (offset >= bytes_read) {
+                        break;
+                    }
+                    
+                    // Prepare buffer for disassembly
+                    std::vector<uint8_t> disasm_buffer(16, 0);
+                    size_t bytes_to_copy = std::min<size_t>(16, bytes_read - offset);
+                    std::copy(memory_buffer.data() + offset, memory_buffer.data() + offset + bytes_to_copy, disasm_buffer.data());
+                    
+                    // Try to disassemble this chunk as a single instruction
+                    auto disasm_result = libmem::Disassemble(
+                        reinterpret_cast<libmem::Address>(disasm_buffer.data()),
+                        arch,
+                        bytes_to_copy,
+                        1,  // instruction count = 1
+                        current_addr  // use original address for display
+                    );
+                    
+                    if (!disasm_result.has_value() || disasm_result->empty()) {
+                        // Failed to disassemble, show raw bytes
+                        std::stringstream ss;
+                        ss << FormatAsHex(current_addr, 16) << ": [Invalid] ";
+                        for (size_t i = 0; i < std::min<size_t>(4, bytes_to_copy); i++) {
+                            ss << std::setfill('0') << std::setw(2) << std::hex << (int)disasm_buffer[i] << " ";
+                        }
+                        disasm_entries.push_back(ss.str());
+                        current_addr += 1; // Move forward by one byte
+                        continue;
+                    }
+                    
+                    // Get the instruction
+                    const auto& inst = disasm_result->front();
+                    
+                    // Format instruction for display
+                    std::stringstream ss;
+                    ss << FormatAsHex(current_addr, 16) << ": ";
+                    
+                    // Add bytes in hex
+                    ss << "[ ";
+                    for (size_t i = 0; i < inst.bytes.size(); i++) {
+                        ss << std::setfill('0') << std::setw(2) << std::hex << (int)inst.bytes[i] << " ";
+                    }
+                    ss << "] ";
+                    
+                    // Add mnemonic and operands
+                    ss << inst.mnemonic;
+                    if (!inst.op_str.empty()) {
+                        ss << " " << inst.op_str;
+                    }
+                    
+                    disasm_entries.push_back(ss.str());
+                    
+                    // Check if this is a return instruction
+                    if (inst.mnemonic.find("ret") != std::string::npos) {
+                        break;
+                    }
+                    
+                    // Move to next instruction
+                    current_addr += inst.bytes.size();
+                    instructions_found++;
+                }
+            } else {
+                disasm_entries.push_back("Failed to read memory from process");
+            }
+        } catch (const std::exception& e) {
+            disasm_entries.push_back("Error: " + std::string(e.what()));
+        }
+    } else {
+        disasm_entries.push_back("Select a process to view disassembly");
+    }
+
+    // Process and module info section - show real data
     auto info_section = vbox({
         text("Process Information:"),
         hbox({
-            text(" CPU Usage: "),
-            gauge(selected_process.cpu_usage / 10.0),
+            text(" Name: "),
+            text(selected_process_info.name),
         }),
         hbox({
-            text(" Memory: "),
-            text(std::to_string(selected_process.memory_mb) + " MB"),
+            text(" PID: "),
+            text(std::to_string(selected_process_info.pid)),
+        }),
+        hbox({
+            text(" Status: "),
+            text(selected_process.has_value() ? "Selected" : "No Process"),
         }),
         separator(),
         text("Module Information:"),
+        hbox({
+            text(" Name: "),
+            text(selected_module.name),
+        }),
         hbox({
             text(" Base Address: "),
             text(selected_module.base_address),
@@ -1143,168 +1386,510 @@ int main() {
             text(" Size: "),
             text(std::to_string(selected_module.size_kb) + " KB"),
         }),
-        separator(),
-        text("Additional Information:"),
-        hbox({
-            text(" PID: "),
-            text(std::to_string(selected_process.pid)),
-        }),
-        hbox({
-            text(" Priority: "),
-            text("Normal"),
-        }),
-        hbox({
-            text(" Threads: "),
-            text(std::to_string(4 + (current_counter % 8))),
-        }),
-        hbox({
-            text(" Handles: "),
-            text(std::to_string(120 + (current_counter % 50))),
-        }),
     }) | border;
 
     // Selection info panels
     Element memory_info;
-    if (memory_selected >= 0 && memory_selected < static_cast<int>(memory_entries.size())) {
-        uint64_t addr = fixed_addresses[memory_selected];
-        memory_info = vbox({
-            text("Selected Memory:"),
-            text(" Address: " + FormatAsHex(addr)),
-            text(" Value (int): " + std::to_string(current_counter + memory_selected)),
-            text(" As float: " + std::to_string(static_cast<float>(current_counter + memory_selected))),
-            text(" As double: " + std::to_string(static_cast<double>(current_counter + memory_selected))),
-        }) | border;
+    if (memory_selected >= 0 && memory_selected < static_cast<int>(memory_entries.size()) &&
+        selected_process.has_value() && !libmem_modules.empty()) {
+        // Calculate the actual address for the selected row
+        libmem::Address display_addr = 0;
+        if (current_memory_address != 0) {
+            display_addr = current_memory_address + (memory_scroll_offset * 16);
+        } else if (module_selected >= 0 && module_selected < static_cast<int>(libmem_modules.size())) {
+            display_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+        } else {
+            display_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+        }
+
+        libmem::Address addr = display_addr + (memory_selected * 16);
+
+        // Try to read real memory value at the selected address
+        std::string addr_str = "N/A";
+        std::string int_value_str = "N/A";
+        std::string float_value_str = "N/A";
+        std::string double_value_str = "N/A";
+
+        try {
+            std::vector<uint8_t> buffer(16, 0);
+            size_t bytes_read = libmem::ReadMemory(&selected_process.value(), addr, buffer.data(), 16);
+
+            // Format address
+            std::stringstream ss;
+            ss << "0x" << std::hex << std::setfill('0') << std::setw(12) << addr;
+            addr_str = ss.str();
+
+            if (bytes_read >= 4) {
+                int32_t int_value = *reinterpret_cast<int32_t*>(buffer.data());
+                uint32_t uint_value = *reinterpret_cast<uint32_t*>(buffer.data());
+
+                // Format as both signed and unsigned
+                std::stringstream is;
+                is << std::dec << int_value << " (0x" << std::hex << std::setfill('0') << std::setw(8) << uint_value << ")";
+                int_value_str = is.str();
+
+                float float_value = *reinterpret_cast<float*>(buffer.data());
+                std::stringstream fs;
+                fs << std::dec << std::fixed << std::setprecision(6) << float_value;
+                float_value_str = fs.str();
+            }
+
+            if (bytes_read >= 8) {
+                double double_value = *reinterpret_cast<double*>(buffer.data());
+                std::stringstream ds;
+                ds << std::dec << std::fixed << std::setprecision(6) << double_value;
+                double_value_str = ds.str();
+            }
+        } catch (...) {
+            // Ignore errors
+        }
+
+        Elements memory_info_elements = {
+            text("Selected Memory:") | bold,
+            text("Address: " + addr_str),
+            separator(),
+            text("int32: " + int_value_str),
+            text(""),
+            text("float: " + float_value_str),
+            text(""),
+            text("double: " + double_value_str),
+        };
+        memory_info = vbox(memory_info_elements) | border;
     } else {
-        memory_info = text("No memory selected") | border;
+        // Show placeholder with instructions
+        Elements placeholder_elements = {
+            text("Selected Memory:") | bold,
+            text(""),
+            text("Navigate memory with"),
+            text("arrow keys to view"),
+            text("value interpretations"),
+            text(""),
+            text("↑↓ : Scroll"),
+            text("PgUp/Dn : Fast scroll"),
+        };
+        memory_info = vbox(placeholder_elements) | border;
     }
     
     Element disasm_info;
-    if (disasm_selected >= 0 && disasm_selected < static_cast<int>(disasm_entries.size())) {
-        auto& instr = disasm[disasm_selected];
-        disasm_info = vbox({
-            text("Selected Instruction:"),
-            text(" Address: " + FormatAsHex(instr.address)),
-            text(" Bytes: " + instr.bytes),
-            text(" Operation: " + instr.mnemonic + " " + instr.operands),
-        }) | border;
+    if (disasm_selected >= 0 && disasm_selected < static_cast<int>(disasm_entries.size()) &&
+        selected_process.has_value() && !libmem_modules.empty()) {
+        // Calculate the disassembly base address (same as used for generating disasm_entries)
+        libmem::Address disasm_base = 0;
+
+        // Calculate the address of the selected memory row
+        if (memory_selected >= 0 && memory_selected < (int)memory_entries.size()) {
+            // Use the same address calculation as the memory viewer
+            libmem::Address display_addr = 0;
+            if (current_memory_address != 0) {
+                display_addr = current_memory_address + (memory_scroll_offset * 16);
+            } else if (module_selected >= 0 && module_selected < (int)libmem_modules.size()) {
+                display_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+            } else {
+                display_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+            }
+
+            // Use the selected row's address
+            disasm_base = display_addr + (memory_selected * 16);
+        } else {
+            // Fallback to module base if no memory selected
+            disasm_base = libmem_modules[0].base;
+        }
+
+        // The selected instruction address is relative to disasm_base
+        // We need to read from the actual disasm list to get the real address
+        // For now, just show the disasm_base address as the selected instruction
+        libmem::Address addr = disasm_base;
+        std::string instruction_text = "No instruction data";
+
+        try {
+            // Read memory to get actual instruction bytes
+            std::vector<uint8_t> inst_buffer(16, 0);
+            size_t bytes_read = libmem::ReadMemory(&selected_process.value(), addr, inst_buffer.data(), inst_buffer.size());
+
+            if (bytes_read > 0) {
+                // Format the instruction bytes
+                std::stringstream ss;
+                ss << "[ ";
+                for (size_t i = 0; i < std::min<size_t>(8, bytes_read); i++) {
+                    ss << std::setfill('0') << std::setw(2) << std::hex << (int)inst_buffer[i] << " ";
+                }
+                ss << "]";
+                instruction_text = ss.str();
+            }
+        } catch (const std::exception& e) {
+            instruction_text = "Error reading instruction";
+        }
+        
+        // Format address as hex
+        std::stringstream addr_ss;
+        addr_ss << "0x" << std::hex << std::setfill('0') << std::setw(12) << addr;
+
+        Elements disasm_info_elements = {
+            text("Selected Instruction:") | bold,
+            text("Address: " + addr_ss.str()),
+            text("Bytes: " + instruction_text),
+            separator(),
+            text("Index: " + std::to_string(disasm_selected)),
+        };
+        disasm_info = vbox(disasm_info_elements) | border;
     } else {
-        disasm_info = text("No instruction selected") | border;
+        // Show placeholder with instructions
+        Elements placeholder_elements = {
+            text("Selected Instruction:") | bold,
+            text(""),
+            text("Disassembly follows"),
+            text("your memory selection"),
+            text(""),
+            text("Press D or ENTER in"),
+            text("DISASSEMBLY panel for"),
+            text("detailed view"),
+        };
+        disasm_info = vbox(placeholder_elements) | border;
     }
 
-    // Create memory and disassembly section titles
-    auto memory_section_title = vbox({
-        bold(text(memory_title)),
+    // Create memory section
+    auto memory_section = vbox({
+        text(memory_title) | bold | color(active_panel == ActivePanel::MEMORY ? Color::YellowLight : Color::White),
         separator(),
+        memory_menu->Render() | vscroll_indicator | frame | flex,
     });
-    
-    auto disasm_section_title = vbox({
-        bold(text(disasm_title)),
+
+    // Create disassembly section
+    auto disasm_section = vbox({
+        text(disasm_title) | bold | color(active_panel == ActivePanel::DISASSEMBLY ? Color::MagentaLight : Color::White),
         separator(),
+        disasm_menu->Render() | vscroll_indicator | frame | flex,
+    });
+
+    // Build status bar with context-sensitive keybinds
+    std::string keybinds = "";
+    switch (active_panel) {
+      case ActivePanel::PROCESSES:
+        keybinds = "TAB:Next | F:Filter | ENTER:Select | Q:Quit";
+        break;
+      case ActivePanel::MODULES:
+        keybinds = "TAB:Next | F:Filter | ENTER:View | Q:Quit";
+        break;
+      case ActivePanel::MEMORY:
+        keybinds = "TAB:Next | ↑↓:Scroll | PgUp/Dn:Fast | Home/End:Jump | ENTER:Watch | S:Scan | G:Goto | Q:Quit";
+        break;
+      case ActivePanel::DISASSEMBLY:
+        keybinds = "TAB:Next | ENTER:View | D:Disasm | Q:Quit";
+        break;
+    }
+
+    auto status_bar = hbox({
+      text(" Status: ") | bold,
+      text(status_message),
+      separator(),
+      text(" | ") | bold,
+      text(keybinds) | color(Color::Cyan),
     });
 
     return vbox({
-              // Top panel with menus and info - 50% of height
+              // Top panel with process and module lists - smaller
               hbox({
-                // Left side with process and module lists - 60% of width
-                hbox({
-                  process_section | flex,
-                  separator(),
-                  module_section | flex,
-                }) | size(WIDTH, GREATER_THAN, 60),
+                process_section | flex,
                 separator(),
-                // Right side with disassembly - 40% of width
-                vbox({
-                  disasm_section_title,
-                  disasm_menu->Render() | vscroll_indicator | frame | flex,
-                  disasm_info,
-                }) | size(WIDTH, LESS_THAN, 40),
-              }) | size(HEIGHT, GREATER_THAN, 50),
+                module_section | flex,
+              }) | size(HEIGHT, LESS_THAN, 15),
+
               separator(),
-              // Bottom panel with memory display and info - 50% of height
+
+              // Middle panel with disassembly and process info - smaller
               hbox({
-                // Left side with info - 30% of width
-                vbox({
-                  info_section,
-                  memory_info,
-                }) | size(WIDTH, LESS_THAN, 30),
+                // Left side with disassembly
+                disasm_section | flex,
                 separator(),
-                // Right side with memory display - 70% of width
+                // Right side with process info
+                info_section | size(WIDTH, LESS_THAN, 25),
+              }) | size(HEIGHT, LESS_THAN, 15),
+
+              separator(),
+
+              // Bottom panel with memory display and instruction info - MUCH BIGGER
+              hbox({
+                // Left side with memory display - takes most space
+                memory_section | flex,
+                separator(),
+                // Right side with instruction and memory info
                 vbox({
-                  memory_section_title,
-                  memory_menu->Render() | vscroll_indicator | frame | flex,
-                }) | size(WIDTH, GREATER_THAN, 70),
-              }) | size(HEIGHT, LESS_THAN, 50),
+                  disasm_info | size(HEIGHT, EQUAL, 12),
+                  memory_info | size(HEIGHT, EQUAL, 12),
+                }) | size(WIDTH, LESS_THAN, 35),
+              }) | flex,
+
+              separator(),
+
+              // Status bar - compact
+              status_bar,
           }) | border;
   });
 
-  // Add event handling 
+  // Add event handling - COMPLETELY REWRITTEN
   auto with_key_events = CatchEvent(component, [&](Event event) {
-    if (event == Event::Character('f') || event == Event::Character('F')) {
-      // Determine which side is active
-      auto is_process_active = process_container->Active() || process_filter_input->Active();
-      auto is_module_active = module_container->Active() || module_filter_input->Active();
-      
-      if (is_process_active) {
-        // Toggle process filter
-        show_process_filter = !show_process_filter;
-        if (show_process_filter) {
-          process_container->SetActiveChild(process_filter_input);
-        } else {
-          process_container->SetActiveChild(process_menu);
-        }
-        return true;
-      } else if (is_module_active) {
-        // Toggle module filter
-        show_module_filter = !show_module_filter;
-        if (show_module_filter) {
-          module_container->SetActiveChild(module_filter_input);
-        } else {
-          module_container->SetActiveChild(module_menu);
-        }
-        return true;
+    // Global keybinds
+
+    // TAB - Switch between panels
+    if (event == Event::Tab || event == Event::TabReverse) {
+      int next_panel = (int)active_panel;
+      if (event == Event::Tab) {
+        next_panel = (next_panel + 1) % 4;
+      } else {
+        next_panel = (next_panel - 1 + 4) % 4;
       }
+      active_panel = (ActivePanel)next_panel;
+      status_message = "Switched to panel " + std::to_string(next_panel);
+      return true;
     }
-    // Handle escape to exit filtering
+
+    // Q - Quit
+    if (event == Event::Character('q') || event == Event::Character('Q')) {
+      screen.Exit();
+      return true;
+    }
+
+    // ESC - Exit filter/dialog modes
     if (event == Event::Escape) {
       if (show_process_filter) {
         show_process_filter = false;
         process_container->SetActiveChild(process_menu);
+        status_message = "Filter closed";
         return true;
       }
       if (show_module_filter) {
         show_module_filter = false;
         module_container->SetActiveChild(module_menu);
+        status_message = "Filter closed";
         return true;
       }
+      if (show_signature_dialog) {
+        show_signature_dialog = false;
+        status_message = "Signature scan canceled";
+        return true;
+      }
+      if (show_address_dialog) {
+        show_address_dialog = false;
+        status_message = "Goto canceled";
+        return true;
+      }
+      return false;
     }
-    
+
+    // Panel-specific keybinds
+    switch (active_panel) {
+      case ActivePanel::PROCESSES: {
+        // F - Toggle filter
+        if (event == Event::Character('f') || event == Event::Character('F')) {
+          show_process_filter = !show_process_filter;
+          if (show_process_filter) {
+            process_container->SetActiveChild(process_filter_input);
+            status_message = "Filter mode active";
+          } else {
+            process_container->SetActiveChild(process_menu);
+            status_message = "Filter mode closed";
+          }
+          return true;
+        }
+
+        // ENTER - Select process
+        if (event == Event::Return && !show_process_filter) {
+          if (process_selected >= 0 && process_selected < (int)filtered_processes.size()) {
+            auto& selected_proc_info = filtered_processes[process_selected];
+
+            // Find the corresponding libmem process
+            for (const auto& proc : libmem_processes) {
+              if (proc.pid == selected_proc_info.pid) {
+                selected_process = proc;
+                break;
+              }
+            }
+
+            if (selected_process.has_value()) {
+              // Load modules for the selected process
+              auto modules_opt = libmem::EnumModules(&selected_process.value());
+              if (modules_opt.has_value()) {
+                libmem_modules = modules_opt.value();
+                all_modules.clear();
+
+                // Convert libmem::Module to ModuleInfo for display
+                for (const auto& mod : libmem_modules) {
+                  ModuleInfo info;
+                  info.name = mod.name;
+                  std::stringstream ss;
+                  ss << "0x" << std::hex << mod.base;
+                  info.base_address = ss.str();
+                  info.size_kb = mod.size / 1024;
+                  all_modules.push_back(info);
+                }
+
+                // Update filtered modules
+                filtered_modules = all_modules;
+                module_entries.clear();
+                for (const auto& module : filtered_modules) {
+                  module_entries.push_back(module.name);
+                }
+
+                module_selected = 0;
+                active_panel = ActivePanel::MODULES;
+                status_message = "Process selected: " + selected_proc_info.name + " (PID: " + std::to_string(selected_proc_info.pid) + ")";
+              } else {
+                status_message = "Failed to load modules for process";
+              }
+            } else {
+              status_message = "Failed to select process";
+            }
+          }
+          return true;
+        }
+        break;
+      }
+
+      case ActivePanel::MODULES: {
+        // F - Toggle filter
+        if (event == Event::Character('f') || event == Event::Character('F')) {
+          show_module_filter = !show_module_filter;
+          if (show_module_filter) {
+            module_container->SetActiveChild(module_filter_input);
+            status_message = "Filter mode active";
+          } else {
+            module_container->SetActiveChild(module_menu);
+            status_message = "Filter mode closed";
+          }
+          return true;
+        }
+
+        // ENTER - View module memory
+        if (event == Event::Return && !show_module_filter) {
+          if (module_selected >= 0 && module_selected < (int)libmem_modules.size() &&
+              selected_process.has_value()) {
+            auto& mod = libmem_modules[module_selected];
+            current_memory_address = mod.base;
+            memory_scroll_offset = 0;
+            active_panel = ActivePanel::MEMORY;
+            status_message = "Viewing module: " + mod.name;
+          }
+          return true;
+        }
+        break;
+      }
+
+      case ActivePanel::MEMORY: {
+        // S - Signature scan
+        if (event == Event::Character('s') || event == Event::Character('S')) {
+          if (selected_process.has_value()) {
+            show_signature_dialog = true;
+            status_message = "Enter signature pattern...";
+          } else {
+            status_message = "No process selected";
+          }
+          return true;
+        }
+
+        // G - Goto address
+        if (event == Event::Character('g') || event == Event::Character('G')) {
+          show_address_dialog = true;
+          status_message = "Enter address...";
+          return true;
+        }
+
+        // Arrow Up/Down - Scroll memory (1 row at a time for precision)
+        if (event == Event::ArrowUp) {
+          memory_scroll_offset = std::max(0, memory_scroll_offset - 1);
+          std::stringstream ss;
+          ss << "Scroll offset: " << memory_scroll_offset;
+          status_message = ss.str();
+          return true;
+        }
+        if (event == Event::ArrowDown) {
+          memory_scroll_offset += 1;
+          std::stringstream ss;
+          ss << "Scroll offset: " << memory_scroll_offset;
+          status_message = ss.str();
+          return true;
+        }
+
+        // Page Up/Down - Scroll memory (faster, 20 rows)
+        if (event == Event::PageUp) {
+          memory_scroll_offset = std::max(0, memory_scroll_offset - 20);
+          std::stringstream ss;
+          ss << "Scrolled up - offset: " << memory_scroll_offset;
+          status_message = ss.str();
+          return true;
+        }
+        if (event == Event::PageDown) {
+          memory_scroll_offset += 20;
+          std::stringstream ss;
+          ss << "Scrolled down - offset: " << memory_scroll_offset;
+          status_message = ss.str();
+          return true;
+        }
+
+        // Home/End - Jump to start/far in memory
+        if (event == Event::Home) {
+          memory_scroll_offset = 0;
+          status_message = "Jumped to start of memory region";
+          return true;
+        }
+        if (event == Event::End) {
+          memory_scroll_offset += 100;
+          status_message = "Jumped forward in memory";
+          return true;
+        }
+
+        // ENTER - Watch memory region
+        if (event == Event::Return) {
+          if (memory_selected >= 0 && memory_selected < (int)memory_entries.size() &&
+              selected_process.has_value() && !libmem_modules.empty()) {
+            // Calculate address
+            libmem::Address display_addr = 0;
+            if (current_memory_address != 0) {
+              display_addr = current_memory_address + (memory_scroll_offset * 16);
+            } else if (module_selected >= 0 && module_selected < (int)libmem_modules.size()) {
+              display_addr = libmem_modules[module_selected].base + (memory_scroll_offset * 16);
+            } else {
+              display_addr = libmem_modules[0].base + (memory_scroll_offset * 16);
+            }
+
+            libmem::Address addr = display_addr + (memory_selected * 16);
+            watch_memory_region(selected_process.value(), addr, 64);
+          }
+          return true;
+        }
+        break;
+      }
+
+      case ActivePanel::DISASSEMBLY: {
+        // D - Disassemble at address
+        if (event == Event::Character('d') || event == Event::Character('D')) {
+          if (disasm_selected >= 0 && disasm_selected < (int)disasm_entries.size() &&
+              selected_process.has_value() && !libmem_modules.empty()) {
+            libmem::Address base_addr = module_selected >= 0 && module_selected < (int)libmem_modules.size() ?
+                                        libmem_modules[module_selected].base : libmem_modules[0].base;
+            libmem::Address addr = base_addr + (disasm_selected * 4);
+            disassemble_memory_region(selected_process.value(), addr, 20);
+          }
+          return true;
+        }
+
+        // ENTER - View disassembly
+        if (event == Event::Return) {
+          if (disasm_selected >= 0 && disasm_selected < (int)disasm_entries.size() &&
+              selected_process.has_value() && !libmem_modules.empty()) {
+            libmem::Address base_addr = module_selected >= 0 && module_selected < (int)libmem_modules.size() ?
+                                        libmem_modules[module_selected].base : libmem_modules[0].base;
+            libmem::Address addr = base_addr + (disasm_selected * 4);
+            disassemble_memory_region(selected_process.value(), addr, 20);
+          }
+          return true;
+        }
+        break;
+      }
+    }
+
     return false;
   });
 
-  // Create an animated component that refreshes continuously
-  auto animated = Renderer(with_key_events, [&] {
-    // Force a refresh
-    screen.PostEvent(Event::Custom);
-    return with_key_events->Render();
-  });
-
-  // Start a refresh thread to update the UI
-  std::thread refresh_thread([&screen]() {
-    while (true) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(33)); // ~30 FPS
-      screen.PostEvent(Event::Custom);
-    }
-  });
-  
-  // Set the refresh thread to detach so it doesn't block when we exit
-  refresh_thread.detach();
-
-  // Start the main loop
-  screen.Loop(animated);
-  
-  // Clean up the counter thread before exiting
-  thread_running = false;
-  if (counter_thread.joinable()) {
-    counter_thread.join();
-  }
+  // Start the main loop - no constant refresh needed
+  screen.Loop(with_key_events);
 }
